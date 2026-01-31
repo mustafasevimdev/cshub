@@ -122,6 +122,13 @@ export function useVoice(channelId: string | null) {
                 await pc.setRemoteDescription(new RTCSessionDescription(data))
             } else if (type === 'ice-candidate') {
                 if (data) await pc.addIceCandidate(new RTCIceCandidate(data))
+            } else if (type === 'speaking') {
+                setState(prev => {
+                    const newSpeaking = new Set(prev.speakingUsers)
+                    if (data.isSpeaking) newSpeaking.add(fromUserId)
+                    else newSpeaking.delete(fromUserId)
+                    return { ...prev, speakingUsers: newSpeaking }
+                })
             }
         } catch (error) {
             console.error('WebRTC Signal Error:', error)
@@ -333,12 +340,17 @@ export function useVoice(channelId: string | null) {
 
             if (isSpeaking !== lastIsSpeaking) {
                 lastIsSpeaking = isSpeaking
+
+                // Update Local State
                 setState(prev => {
                     const newSpeaking = new Set(prev.speakingUsers)
                     if (isSpeaking) newSpeaking.add(user.id)
                     else newSpeaking.delete(user.id)
                     return { ...prev, speakingUsers: newSpeaking }
                 })
+
+                // Broadcast to others
+                sendSignal('speaking', { isSpeaking })
             }
 
             animationFrameRef.current = requestAnimationFrame(check)
@@ -408,10 +420,15 @@ export function useVoice(channelId: string | null) {
         setState(prev => ({ ...prev, isScreenSharing: false }))
     }
 
-    // Cleanup on unmount
+    // Auto-join/leave based on channelId
     useEffect(() => {
+        if (channelId) {
+            joinVoice()
+        } else {
+            cleanup()
+        }
         return () => { cleanup() }
-    }, [cleanup])
+    }, [channelId, joinVoice, cleanup])
 
     return {
         ...state,

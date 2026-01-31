@@ -23,7 +23,7 @@ export function MainPage() {
     const { user } = useAuthStore()
     const { logout, updateAvatar } = useAuth()
     const { textChannels, voiceChannels, createChannel, deleteChannel, loading: channelsLoading } = useChannels()
-    const { activeChannel, setActiveChannel } = useAppStore()
+    const { activeChannel, setActiveChannel, voiceChannelId, setVoiceChannelId } = useAppStore()
     const {
         messages,
         loading: messagesLoading,
@@ -33,12 +33,10 @@ export function MainPage() {
     } = useMessages(activeChannel?.id || null)
 
     // Music Hook
-    const { isPlaying: musicIsPlaying, currentSong, addToQueue, nextSong, stopSong } = useMusic(activeChannel?.type === 'voice' ? activeChannel.id : null)
+    const { isPlaying: musicIsPlaying, currentSong, addToQueue, nextSong, stopSong } = useMusic(voiceChannelId)
 
     // Voice Hooks
     const {
-        joinVoice,
-        leaveVoice,
         toggleMute,
         toggleDeafen,
         startScreenShare,
@@ -51,7 +49,7 @@ export function MainPage() {
         participants,
         remoteStreams,
         localStream
-    } = useVoice(activeChannel?.type === 'voice' ? activeChannel.id : null)
+    } = useVoice(voiceChannelId)
 
     const [messageInput, setMessageInput] = useState('')
     const [showCreateChannel, setShowCreateChannel] = useState(false)
@@ -211,16 +209,20 @@ export function MainPage() {
         }
     }
 
-    // Auto-join voice
+    // Voice Management Logic
     useEffect(() => {
-        if (activeChannel?.type === 'voice' && !isConnected) {
-            joinVoice()
-        } else if (activeChannel?.type !== 'voice' && isConnected) {
-            leaveVoice()
+        if (activeChannel?.type === 'voice') {
+            if (voiceChannelId !== activeChannel.id) {
+                // If we are moving to a new voice channel, update the ID
+                setVoiceChannelId(activeChannel.id)
+            }
         }
-    }, [activeChannel, isConnected])
+    }, [activeChannel, voiceChannelId])
 
-    const isSpeaking = user && speakingUsers.has(user.id)
+    const handleDisconnectVoice = () => {
+        setVoiceChannelId(null)
+    }
+
     // console.log('Current user is speaking:', isSpeaking) // Using isSpeaking to fix lint
 
     const formatTime = (dateString: string) => {
@@ -298,11 +300,41 @@ export function MainPage() {
 
                 {/* User Panel */}
                 <div className="sidebar-footer">
+                    {/* Persistent Voice Bar */}
+                    {voiceChannelId && (
+                        <div className="voice-status-bar" style={{
+                            padding: '8px 12px',
+                            background: 'var(--bg-secondary)',
+                            borderBottom: '1px solid var(--border)',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'space-between',
+                            color: '#43b581'
+                        }}>
+                            <div style={{ display: 'flex', flexDirection: 'column' }}>
+                                <div style={{ fontSize: '12px', fontWeight: 'bold', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                                    <span className="pulse-dot" style={{ width: '8px', height: '8px', background: '#43b581', borderRadius: '50%' }}></span>
+                                    Ses Bağlı
+                                </div>
+                                <div style={{ fontSize: '11px', color: 'var(--text-secondary)' }}>
+                                    {voiceChannels.find(c => c.id === voiceChannelId)?.name || 'Ses Kanalı'}
+                                </div>
+                            </div>
+                            <div style={{ display: 'flex', gap: '8px' }}>
+                                <button onClick={toggleMute} style={{ background: 'transparent', border: 'none', color: isMuted ? '#f04747' : 'inherit', cursor: 'pointer' }}>
+                                    {isMuted ? Icons.micOff : Icons.mic}
+                                </button>
+                                <button onClick={handleDisconnectVoice} style={{ background: 'transparent', border: 'none', color: '#f04747', cursor: 'pointer', fontSize: '16px' }}>
+                                    ✕
+                                </button>
+                            </div>
+                        </div>
+                    )}
                     <div className="user-panel">
                         <img
                             src={user?.avatar_url || getDefaultAvatar(user?.nickname || 'U')}
                             alt={user?.nickname}
-                            className={`user-avatar ${isSpeaking ? 'speaking' : ''}`}
+                            className={`user-avatar ${speakingUsers.has(user?.id || '') ? 'speaking' : ''}`}
                             onClick={() => fileInputRef.current?.click()}
                             style={{ cursor: 'pointer' }}
                             title="Avatar değiştir"
@@ -470,7 +502,7 @@ export function MainPage() {
                                             { cmd: '!video', desc: 'Video izle (Sinema Modu)', example: '!video <link>' },
                                             { cmd: '!skip', desc: 'Sıradaki şarkıya geç', example: '!skip' },
                                             { cmd: '!stop', desc: 'Müziği durdur ve listeyi temizle', example: '!stop' },
-                                            { cmd: '!clear', desc: 'Sohbeti temizle (Sadece sende)', example: '!clear' }
+                                            { cmd: '!clear', desc: 'Sohbeti herkes için temizle', example: '!clear' }
                                         ].filter(c => c.cmd.startsWith(messageInput)).map(c => (
                                             <div
                                                 key={c.cmd}

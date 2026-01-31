@@ -1005,6 +1005,50 @@ body {
     color: var(--text-primary);
     font-family: inherit;
     font-size: 14px;
+    appearance: none;
+    -webkit-appearance: none;
+}
+
+/* Speaking Animation */
+.voice-participant.speaking .avatar {
+    border: 2px solid #50a361 !important;
+    box-shadow: 0 0 8px #50a361;
+    animation: pulse-speaking 1s infinite;
+}
+
+@keyframes pulse-speaking {
+    0% {
+        box-shadow: 0 0 0 0 rgba(80, 163, 97, 0.7);
+    }
+
+    70% {
+        box-shadow: 0 0 0 10px rgba(80, 163, 97, 0);
+    }
+
+    100% {
+        box-shadow: 0 0 0 0 rgba(80, 163, 97, 0);
+    }
+}
+
+.pulse-dot {
+    animation: simple-pulse 2s infinite;
+}
+
+@keyframes simple-pulse {
+    0% {
+        transform: scale(0.95);
+        opacity: 0.5;
+    }
+
+    50% {
+        transform: scale(1.1);
+        opacity: 1;
+    }
+
+    100% {
+        transform: scale(0.95);
+        opacity: 0.5;
+    }
 }
 
 .settings-select:focus {

@@ -26,6 +26,8 @@ export const useAuthStore = create<AuthState>()(
 interface AppState {
     activeChannel: Channel | null
     setActiveChannel: (channel: Channel | null) => void
+    voiceChannelId: string | null
+    setVoiceChannelId: (id: string | null) => void
     sidebarOpen: boolean
     toggleSidebar: () => void
 }
@@ -33,6 +35,8 @@ interface AppState {
 export const useAppStore = create<AppState>((set) => ({
     activeChannel: null,
     setActiveChannel: (channel) => set({ activeChannel: channel }),
+    voiceChannelId: null,
+    setVoiceChannelId: (id) => set({ voiceChannelId: id }),
     sidebarOpen: true,
     toggleSidebar: () => set((state) => ({ sidebarOpen: !state.sidebarOpen })),
 }))
