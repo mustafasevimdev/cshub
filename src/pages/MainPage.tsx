@@ -28,7 +28,6 @@ export function MainPage() {
         messages,
         loading: messagesLoading,
         sendMessage,
-        clearMessages,
         clearChannelMessages,
         messagesEndRef
     } = useMessages(activeChannel?.id || null)

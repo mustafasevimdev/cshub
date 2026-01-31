@@ -217,7 +217,7 @@ export function useVoice(channelId: string | null) {
                         handleSignal(payload.payload)
                     }
                 })
-                .on('presence', { event: 'join' }, ({ key, newPresences }: any) => {
+                .on('presence', { event: 'join' }, ({ newPresences }: any) => {
                     // Initiate connection to new joiners
                     newPresences.forEach((presence: any) => {
                         if (presence.user_id !== user.id) {

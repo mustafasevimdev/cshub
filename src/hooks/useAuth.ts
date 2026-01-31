@@ -38,8 +38,7 @@ export function useAuth() {
     const updateStatus = async (status: 'online' | 'offline' | 'busy' | 'idle') => {
         if (!user) return
 
-        await supabase
-            .from('users')
+        await (supabase.from('users') as any)
             .update({ status, last_seen: new Date().toISOString() })
             .eq('id', user.id)
     }
@@ -50,8 +49,8 @@ export function useAuth() {
 
         try {
             // Check if nickname exists
-            const { data: existing } = await supabase
-                .from('users')
+            const { data: existing } = await (supabase
+                .from('users') as any)
                 .select('id')
                 .eq('nickname', nickname)
                 .single()
@@ -62,8 +61,8 @@ export function useAuth() {
 
             const passwordHash = await hashPassword(password)
 
-            const { data, error: insertError } = await supabase
-                .from('users')
+            const { data, error: insertError } = await (supabase
+                .from('users') as any)
                 .insert({
                     nickname,
                     password_hash: passwordHash,
@@ -92,8 +91,8 @@ export function useAuth() {
         try {
             const passwordHash = await hashPassword(password)
 
-            const { data, error: selectError } = await supabase
-                .from('users')
+            const { data, error: selectError } = await (supabase
+                .from('users') as any)
                 .select('*')
                 .eq('nickname', nickname)
                 .eq('password_hash', passwordHash)
@@ -104,10 +103,10 @@ export function useAuth() {
             }
 
             // Update status to online
-            await supabase
-                .from('users')
+            await (supabase
+                .from('users') as any)
                 .update({ status: 'online', last_seen: new Date().toISOString() })
-                .eq('id', data.id)
+                .eq('id', (data as any).id)
 
             setUser(data as User)
             return { success: true }
@@ -144,8 +143,8 @@ export function useAuth() {
                 .from('avatars')
                 .getPublicUrl(fileName)
 
-            const { error: updateError } = await supabase
-                .from('users')
+            const { error: updateError } = await (supabase
+                .from('users') as any)
                 .update({ avatar_url: urlData.publicUrl })
                 .eq('id', user.id)
 

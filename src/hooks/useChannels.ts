@@ -39,8 +39,8 @@ export function useChannels() {
 
     const fetchChannels = async () => {
         setLoading(true)
-        const { data, error } = await supabase
-            .from('channels')
+        const { data, error } = await (supabase
+            .from('channels') as any)
             .select('*')
             .order('created_at', { ascending: true })
 
@@ -53,8 +53,8 @@ export function useChannels() {
     const createChannel = useCallback(async (name: string, type: 'text' | 'voice') => {
         if (!user) return { success: false, error: 'Not authenticated' }
 
-        const { data, error } = await supabase
-            .from('channels')
+        const { data, error } = await (supabase
+            .from('channels') as any)
             .insert({
                 name,
                 type,
@@ -71,8 +71,8 @@ export function useChannels() {
     }, [user])
 
     const deleteChannel = useCallback(async (channelId: string) => {
-        const { error } = await supabase
-            .from('channels')
+        const { error } = await (supabase
+            .from('channels') as any)
             .delete()
             .eq('id', channelId)
 

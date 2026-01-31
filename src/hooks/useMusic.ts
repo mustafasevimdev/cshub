@@ -11,7 +11,7 @@ export function useMusic(channelId: string | null) {
 
     const fetchQueue = useCallback(async () => {
         if (!channelId) return
-        const { data, error } = await (supabase.from('music_queue') as any)
+        const { data } = await (supabase.from('music_queue') as any)
             .select('*')
             .eq('channel_id', channelId)
             .order('position', { ascending: true })
