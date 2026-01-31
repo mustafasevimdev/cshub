@@ -83,25 +83,27 @@ export function useMessages(channelId: string | null) {
 
         if (!error && data) {
             // Fetch user info for all unique user IDs
-            const userIds = [...new Set(data.map(m => m.user_id))]
+            const userIds = [...new Set((data as any[]).map((m: any) => m.user_id))]
             const { data: users } = await supabase
                 .from('users')
                 .select('*')
                 .in('id', userIds)
 
             const usersMap: Record<string, User> = {}
-            users?.forEach(u => {
-                usersMap[u.id] = u
-            })
+            if (users) {
+                (users as any[]).forEach((u: any) => {
+                    usersMap[u.id] = u
+                })
+            }
             setUsersCache(prev => ({ ...prev, ...usersMap }))
 
             // Attach user info to messages
-            const messagesWithUsers = data.map(m => ({
+            const messagesWithUsers = (data as any[]).map((m: any) => ({
                 ...m,
                 user: usersMap[m.user_id]
             }))
 
-            setMessages(messagesWithUsers)
+            setMessages(messagesWithUsers as any)
         }
 
         setLoading(false)
@@ -140,7 +142,7 @@ export function useMessages(channelId: string | null) {
 
         // Replace temp ID with real ID (optional, but good for consistency)
         if (data) {
-            setMessages(prev => prev.map(m => m.id === tempId ? { ...m, id: data.id } : m))
+            setMessages(prev => prev.map(m => m.id === tempId ? { ...m, id: (data as any).id } : m))
         }
 
         return { success: true }
@@ -165,7 +167,7 @@ export function useMessages(channelId: string | null) {
 
     const clearChannelMessages = useCallback(async () => {
         if (!channelId) return
-        await supabase.from('messages').delete().eq('channel_id', channelId)
+        await (supabase.from('messages') as any).delete().eq('channel_id', channelId)
     }, [channelId])
 
     return {

@@ -351,7 +351,7 @@ export function useVoice(channelId: string | null) {
         if (!state.localStream || !user) return
         const newMuted = !state.isMuted
         state.localStream.getAudioTracks().forEach(t => t.enabled = !newMuted)
-        await supabase.from('voice_participants').update({ is_muted: newMuted }).eq('channel_id', channelId).eq('user_id', user.id)
+        await (supabase.from('voice_participants') as any).update({ is_muted: newMuted }).eq('channel_id', channelId).eq('user_id', user.id)
         setState(prev => ({ ...prev, isMuted: newMuted }))
     }
 
@@ -362,7 +362,7 @@ export function useVoice(channelId: string | null) {
             stream.getAudioTracks().forEach(t => t.enabled = state.isDeafened)
         })
         const newDeafened = !state.isDeafened
-        await supabase.from('voice_participants').update({ is_deafened: newDeafened }).eq('channel_id', channelId).eq('user_id', user.id)
+        await (supabase.from('voice_participants') as any).update({ is_deafened: newDeafened }).eq('channel_id', channelId).eq('user_id', user.id)
         setState(prev => ({ ...prev, isDeafened: newDeafened }))
     }
 
@@ -386,7 +386,7 @@ export function useVoice(channelId: string | null) {
             // Handle stream stop (user clicks "Stop Sharing" in browser UI)
             videoTrack.onended = () => stopScreenShare()
 
-            await supabase.from('voice_participants').update({ is_screen_sharing: true }).eq('channel_id', channelId).eq('user_id', user.id)
+            await (supabase.from('voice_participants') as any).update({ is_screen_sharing: true }).eq('channel_id', channelId).eq('user_id', user.id)
             setState(prev => ({ ...prev, isScreenSharing: true }))
         } catch (e) {
             console.error(e)
@@ -404,7 +404,7 @@ export function useVoice(channelId: string | null) {
             }
         })
 
-        await supabase.from('voice_participants').update({ is_screen_sharing: false }).eq('channel_id', channelId).eq('user_id', user.id)
+        await (supabase.from('voice_participants') as any).update({ is_screen_sharing: false }).eq('channel_id', channelId).eq('user_id', user.id)
         setState(prev => ({ ...prev, isScreenSharing: false }))
     }
 
