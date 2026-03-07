@@ -1,433 +1,1006 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
+import type { RealtimeChannel } from '@supabase/supabase-js'
 import { supabase } from '@/lib/supabase'
 import { useAuthStore } from '@/stores'
-import type { VoiceParticipant, User } from '@/types'
+import type { User, UserRow, VoiceParticipant, VoiceParticipantRow } from '@/types'
+import { AUDIO_SETTINGS_CHANGE_EVENT, getSavedAudioSettings } from './useAudioSettings'
+import type { AudioSettings } from './useAudioSettings'
 
-// WebRTC Configuration
-const RTC_CONFIG = {
-    iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' },
-        { urls: 'stun:global.stun.twilio.com:3478' }
-    ]
+const RTC_CONFIG: RTCConfiguration = {
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:global.stun.twilio.com:3478' }],
 }
+
+type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'speaking' | 'renegotiate'
+type SignalData = RTCSessionDescriptionInit | RTCIceCandidateInit | { isSpeaking: boolean } | null
+
+interface VoiceSignalPayload {
+    type: SignalType
+    data: SignalData
+    fromUserId: string
+    toUserId?: string
+}
+
+interface VoiceBroadcastEnvelope {
+    payload: VoiceSignalPayload
+}
+
+interface PresenceUser {
+    user_id: string
+}
+
+type SinkableAudioElement = HTMLAudioElement & {
+    setSinkId?: (deviceId: string) => Promise<void>
+}
+
+interface RemoteAudioController {
+    audio: SinkableAudioElement
+    sourceNode: MediaStreamAudioSourceNode
+    gainNode: GainNode
+    destinationNode: MediaStreamAudioDestinationNode
+}
+
+
 
 interface VoiceState {
     isConnected: boolean
     isMuted: boolean
     isDeafened: boolean
     isScreenSharing: boolean
-    participants: (VoiceParticipant & { user?: User })[]
+    screenShareStream: MediaStream | null
+    participants: VoiceParticipant[]
     localStream: MediaStream | null
-    remoteStreams: Map<string, MediaStream> // mp -> stream
+    remoteStreams: Map<string, MediaStream>
     speakingUsers: Set<string>
 }
 
+function toPublicUser(userRow: UserRow): User {
+    const { password_hash, ...publicUser } = userRow
+    void password_hash
+    return publicUser
+}
+
 export function useVoice(channelId: string | null) {
-    const { user } = useAuthStore()
+    const userId = useAuthStore((state) => state.user?.id)
     const [state, setState] = useState<VoiceState>({
         isConnected: false,
         isMuted: false,
         isDeafened: false,
         isScreenSharing: false,
+        screenShareStream: null,
         participants: [],
         localStream: null,
         remoteStreams: new Map(),
-        speakingUsers: new Set()
+        speakingUsers: new Set(),
     })
 
-    // Refs
     const localStreamRef = useRef<MediaStream | null>(null)
+    const rawLocalStreamRef = useRef<MediaStream | null>(null)
+    const screenShareStreamRef = useRef<MediaStream | null>(null)
     const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map())
-    const channelRef = useRef<any>(null)
+    const signalChannelRef = useRef<RealtimeChannel | null>(null)
+    const participantsSyncChannelRef = useRef<RealtimeChannel | null>(null)
+    const remoteAudioRefs = useRef<Map<string, SinkableAudioElement>>(new Map())
+    const remoteAudioControllersRef = useRef<Map<string, RemoteAudioController>>(new Map())
 
-    // Audio Analysis Refs
     const audioContextRef = useRef<AudioContext | null>(null)
+    const outputAudioContextRef = useRef<AudioContext | null>(null)
     const analyserRef = useRef<AnalyserNode | null>(null)
+    const microphoneGainRef = useRef<GainNode | null>(null)
     const animationFrameRef = useRef<number | null>(null)
+    const isJoiningRef = useRef(false)
+    const isConnectedRef = useRef(false)
+    const joinAttemptRef = useRef(0)
+    const joinRetryIntervalRef = useRef<number | null>(null)
+    const muteOperationRef = useRef(0)
+    const deafenOperationRef = useRef(0)
+    const isMutedRef = useRef(false)
+    const isDeafenedRef = useRef(false)
+    const audioSettingsRef = useRef<AudioSettings>(getSavedAudioSettings())
 
-    // Cleanup function
+    useEffect(() => {
+        isMutedRef.current = state.isMuted
+    }, [state.isMuted])
+
+    useEffect(() => {
+        isDeafenedRef.current = state.isDeafened
+    }, [state.isDeafened])
+
+    const setAudioSinkId = useCallback(async (audio: SinkableAudioElement, outputDeviceId: string) => {
+        if (typeof audio.setSinkId !== 'function') return
+
+        try {
+            await audio.setSinkId(outputDeviceId === 'default' ? '' : outputDeviceId)
+        } catch (error) {
+            console.error('Failed to set remote output device:', error)
+        }
+    }, [])
+
+    const disposeRemoteAudioController = useCallback((targetUserId: string) => {
+        const controller = remoteAudioControllersRef.current.get(targetUserId)
+        if (!controller) return
+
+        controller.audio.pause()
+        controller.audio.srcObject = null
+        controller.sourceNode.disconnect()
+        controller.gainNode.disconnect()
+        controller.destinationNode.disconnect()
+        remoteAudioControllersRef.current.delete(targetUserId)
+        remoteAudioRefs.current.delete(targetUserId)
+    }, [])
+
+    const upsertRemoteTrack = useCallback((targetUserId: string, track: MediaStreamTrack) => {
+        setState((prev) => {
+            const nextStreams = new Map(prev.remoteStreams)
+            const mergedStream = nextStreams.get(targetUserId) ?? new MediaStream()
+
+            mergedStream.getTracks()
+                .filter((existingTrack) => existingTrack.kind === track.kind && existingTrack.id !== track.id)
+                .forEach((existingTrack) => {
+                    mergedStream.removeTrack(existingTrack)
+                })
+
+            if (!mergedStream.getTracks().some((existingTrack) => existingTrack.id === track.id)) {
+                mergedStream.addTrack(track)
+            }
+
+            nextStreams.set(targetUserId, mergedStream)
+            return { ...prev, remoteStreams: nextStreams }
+        })
+
+        track.onended = () => {
+            setState((prev) => {
+                const nextStreams = new Map(prev.remoteStreams)
+                const mergedStream = nextStreams.get(targetUserId)
+                if (!mergedStream) return prev
+
+                mergedStream.getTracks()
+                    .filter((existingTrack) => existingTrack.id === track.id)
+                    .forEach((existingTrack) => {
+                        mergedStream.removeTrack(existingTrack)
+                    })
+
+                if (mergedStream.getTracks().length === 0) nextStreams.delete(targetUserId)
+                else nextStreams.set(targetUserId, mergedStream)
+
+                return { ...prev, remoteStreams: nextStreams }
+            })
+        }
+    }, [])
+
+    const applyOutputAudioSettings = useCallback(
+        async (settings: AudioSettings) => {
+            remoteAudioControllersRef.current.forEach((controller) => {
+                controller.gainNode.gain.value = settings.outputVolume / 100
+                controller.audio.muted = isDeafenedRef.current
+            })
+
+            await Promise.all(
+                Array.from(remoteAudioControllersRef.current.values()).map(({ audio }) =>
+                    setAudioSinkId(audio, settings.outputDeviceId),
+                ),
+            )
+        },
+        [setAudioSinkId],
+    )
+
+    const applyInputAudioSettings = useCallback(async (settings: AudioSettings) => {
+        if (microphoneGainRef.current) {
+            microphoneGainRef.current.gain.value = settings.inputVolume / 100
+        }
+
+        const activeTrack = rawLocalStreamRef.current?.getAudioTracks()[0]
+        if (!activeTrack) return
+
+        try {
+            await activeTrack.applyConstraints({
+                noiseSuppression: settings.noiseSuppression,
+                echoCancellation: settings.echoCancellation,
+            })
+        } catch (error) {
+            console.error('Failed to apply live microphone constraints:', error)
+        }
+    }, [])
+
+    const requestVoiceStream = useCallback(async (settings: AudioSettings) => {
+        let timedOut = false
+
+        const streamPromise = navigator.mediaDevices.getUserMedia({
+            audio: {
+                deviceId: settings.inputDeviceId !== 'default'
+                    ? { exact: settings.inputDeviceId }
+                    : undefined,
+                echoCancellation: settings.echoCancellation,
+                noiseSuppression: settings.noiseSuppression,
+                autoGainControl: true,
+            },
+            video: false,
+        })
+
+        const safeStreamPromise = streamPromise
+            .then((stream) => {
+                if (timedOut) {
+                    stream.getTracks().forEach((track) => track.stop())
+                    return new MediaStream()
+                }
+
+                return stream
+            })
+            .catch(() => new MediaStream())
+
+        const timeoutPromise = new Promise<MediaStream>((resolve) => {
+            window.setTimeout(() => {
+                timedOut = true
+                resolve(new MediaStream())
+            }, 2500)
+        })
+
+        return Promise.race([safeStreamPromise, timeoutPromise])
+    }, [])
+
+    const withTimeout = useCallback(async <T,>(operation: PromiseLike<T>, timeoutMs: number, label: string) => {
+        let timeoutId: number | null = null
+
+        try {
+            return await Promise.race([
+                Promise.resolve(operation),
+                new Promise<T>((_, reject) => {
+                    timeoutId = window.setTimeout(() => {
+                        reject(new Error(`${label} timed out`))
+                    }, timeoutMs)
+                }),
+            ])
+        } finally {
+            if (timeoutId !== null) {
+                window.clearTimeout(timeoutId)
+            }
+        }
+    }, [])
+
+    const updateParticipantState = useCallback(
+        async (patch: Partial<Pick<VoiceParticipantRow, 'is_muted' | 'is_deafened' | 'is_screen_sharing'>>) => {
+            if (!userId || !channelId) return false
+
+            const { error } = await supabase.from('voice_participants')
+                .update(patch as never)
+                .eq('channel_id', channelId)
+                .eq('user_id', userId)
+
+            if (error) {
+                console.error('Voice participant update failed:', error)
+                return false
+            }
+
+            return true
+        },
+        [channelId, userId],
+    )
+
     const cleanup = useCallback(async () => {
-        console.log('Voice cleanup triggered for channel:', channelId)
-
-        // Close audio context
-        if (audioContextRef.current) {
-            audioContextRef.current.close()
-            audioContextRef.current = null
+        joinAttemptRef.current += 1
+        isConnectedRef.current = false
+        isJoiningRef.current = false
+        if (joinRetryIntervalRef.current !== null) {
+            window.clearInterval(joinRetryIntervalRef.current)
+            joinRetryIntervalRef.current = null
         }
-        if (animationFrameRef.current) {
+
+        if (animationFrameRef.current !== null) {
             cancelAnimationFrame(animationFrameRef.current)
+            animationFrameRef.current = null
         }
 
-        // Stop all tracks using Ref for stability
-        if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach(t => t.stop())
-            localStreamRef.current = null
+        const inputAudioContext = audioContextRef.current
+        audioContextRef.current = null
+        if (inputAudioContext) {
+            await inputAudioContext.close()
+        }
+        const outputAudioContext = outputAudioContextRef.current
+        outputAudioContextRef.current = null
+        if (outputAudioContext) {
+            await outputAudioContext.close()
+        }
+        analyserRef.current = null
+        microphoneGainRef.current = null
+
+        const outboundStream = localStreamRef.current
+        localStreamRef.current = null
+        if (outboundStream) {
+            outboundStream.getTracks().forEach((track) => track.stop())
+        }
+        const rawStream = rawLocalStreamRef.current
+        rawLocalStreamRef.current = null
+        if (rawStream && rawStream !== outboundStream) {
+            rawStream.getTracks().forEach((track) => track.stop())
+        }
+        const screenShareStream = screenShareStreamRef.current
+        screenShareStreamRef.current = null
+        if (screenShareStream) {
+            screenShareStream.getTracks().forEach((track) => track.stop())
         }
 
-        // Close peer connections
-        peersRef.current.forEach(pc => pc.close())
+        peersRef.current.forEach((peer) => peer.close())
         peersRef.current.clear()
 
-        // Cleanup DB and Signal Subscriptions
-        if (channelRef.current) {
-            // Cleanup DB sync sub if exists
-            if (channelRef.current.dbSub) {
-                channelRef.current.dbSub.unsubscribe()
-            }
-            await channelRef.current.unsubscribe()
-            channelRef.current = null
+        remoteAudioControllersRef.current.forEach((_, targetUserId) => {
+            disposeRemoteAudioController(targetUserId)
+        })
+        remoteAudioRefs.current.clear()
+        remoteAudioControllersRef.current.clear()
+
+        const participantsSyncChannel = participantsSyncChannelRef.current
+        participantsSyncChannelRef.current = null
+        if (participantsSyncChannel) {
+            await participantsSyncChannel.unsubscribe()
+        }
+        const signalChannel = signalChannelRef.current
+        signalChannelRef.current = null
+        if (signalChannel) {
+            await signalChannel.unsubscribe()
         }
 
-        // Reset State
-        setState(prev => ({
+        setState((prev) => ({
             ...prev,
             isConnected: false,
+            isMuted: false,
+            isDeafened: false,
             isScreenSharing: false,
+            screenShareStream: null,
             localStream: null,
             remoteStreams: new Map(),
             participants: [],
-            speakingUsers: new Set()
+            speakingUsers: new Set(),
         }))
+        isMutedRef.current = false
+        isDeafenedRef.current = false
 
-        // DB Cleanup
-        if (user && channelId) {
-            await (supabase.from('voice_participants') as any)
-                .delete()
-                .eq('channel_id', channelId)
-                .eq('user_id', user.id)
+        if (userId && channelId) {
+            await supabase.from('voice_participants').delete().eq('channel_id', channelId).eq('user_id', userId)
         }
-    }, [user?.id, channelId])
+    }, [channelId, disposeRemoteAudioController, userId])
 
-    // Signal Handling
-    const handleSignal = useCallback(async (payload: any) => {
-        const { type, fromUserId, data } = payload
-        if (fromUserId === user?.id) return
+    const sendSignal = useCallback(
+        async (type: SignalType, data: SignalData, toUserId?: string) => {
+            if (!signalChannelRef.current || !userId) return
 
-        let pc = peersRef.current.get(fromUserId)
-
-        // Create PC if needed (for incoming offers)
-        if (!pc && type === 'offer') {
-            pc = createPeerConnection(fromUserId)
-        }
-
-        if (!pc) return
-
-        try {
-            if (type === 'offer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(data))
-                const answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
-                sendSignal('answer', answer, fromUserId)
-            } else if (type === 'answer') {
-                await pc.setRemoteDescription(new RTCSessionDescription(data))
-            } else if (type === 'ice-candidate') {
-                if (data) await pc.addIceCandidate(new RTCIceCandidate(data))
-            } else if (type === 'speaking') {
-                setState(prev => {
-                    const newSpeaking = new Set(prev.speakingUsers)
-                    if (data.isSpeaking) newSpeaking.add(fromUserId)
-                    else newSpeaking.delete(fromUserId)
-                    return { ...prev, speakingUsers: newSpeaking }
-                })
-            }
-        } catch (error) {
-            console.error('WebRTC Signal Error:', error)
-        }
-    }, [user])
-
-    // Create RTCPeerConnection
-    const createPeerConnection = (targetUserId: string) => {
-        const pc = new RTCPeerConnection(RTC_CONFIG)
-
-        // Add local tracks
-        localStreamRef.current?.getTracks().forEach(track => {
-            if (localStreamRef.current) {
-                pc.addTrack(track, localStreamRef.current)
-            }
-        })
-
-        // Handle ICE
-        pc.onicecandidate = (event) => {
-            if (event.candidate) {
-                sendSignal('ice-candidate', event.candidate, targetUserId)
-            }
-        }
-
-        // Handle Stream
-        pc.ontrack = (event) => {
-            const stream = event.streams[0]
-            if (stream) {
-                setState(prev => {
-                    const newStreams = new Map(prev.remoteStreams)
-                    newStreams.set(targetUserId, stream)
-
-                    // Create invisible audio element to play stream
-                    const audio = new Audio()
-                    audio.srcObject = stream
-                    audio.autoplay = true
-                    audio.play().catch(console.error)
-
-                    return { ...prev, remoteStreams: newStreams }
-                })
-            }
-        }
-
-        peersRef.current.set(targetUserId, pc)
-        return pc
-    }
-
-    const sendSignal = async (type: string, data: any, toUserId?: string) => {
-        if (!channelRef.current) return
-        await channelRef.current.send({
-            type: 'broadcast',
-            event: 'signal',
-            payload: { type, data, fromUserId: user?.id, toUserId }
-        })
-    }
-
-    // Join Channel
-    const joinVoice = useCallback(async () => {
-        if (!user || !channelId || state.isConnected) return
-
-        try {
-            // 1. Get Local Stream
-            const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true, // Keep on for voice clarity, maybe off for "music mode" later
-                    autoGainControl: true,
-                    sampleRate: 48000, // High quality audio
-                    channelCount: 2,   // Stereo support
-                    sampleSize: 16     // CD Quality bit depth
-                },
-                video: false
+            await signalChannelRef.current.send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: { type, data, fromUserId: userId, toUserId },
             })
-            localStreamRef.current = stream
+        },
+        [userId],
+    )
 
-            // 2. Setup Audio Analysis
-            audioContextRef.current = new AudioContext()
-            const source = audioContextRef.current.createMediaStreamSource(stream)
-            analyserRef.current = audioContextRef.current.createAnalyser()
-            analyserRef.current.fftSize = 256
-            source.connect(analyserRef.current)
-            detectSpeaking()
+    const createPeerConnection = useCallback(
+        (targetUserId: string) => {
+            const peerConnection = new RTCPeerConnection(RTC_CONFIG)
 
-            // 3. Connect to Supabase Channel for Signaling
-            channelRef.current = supabase.channel(`voice:${channelId}`, {
-                config: { broadcast: { self: false } }
-            })
-
-            channelRef.current
-                .on('broadcast', { event: 'signal' }, (payload: any) => {
-                    // Filter signals meant for us
-                    if (!payload.payload.toUserId || payload.payload.toUserId === user.id) {
-                        handleSignal(payload.payload)
-                    }
-                })
-                .on('presence', { event: 'join' }, ({ newPresences }: any) => {
-                    // Initiate connection to new joiners
-                    newPresences.forEach((presence: any) => {
-                        if (presence.user_id !== user.id) {
-                            initiateConnection(presence.user_id)
-                        }
-                    })
-                })
-                .on('presence', { event: 'leave' }, ({ leftPresences }: any) => {
-                    leftPresences.forEach((presence: any) => {
-                        const pc = peersRef.current.get(presence.user_id)
-                        pc?.close()
-                        peersRef.current.delete(presence.user_id)
-                        setState(prev => {
-                            const newStreams = new Map(prev.remoteStreams)
-                            newStreams.delete(presence.user_id)
-                            return { ...prev, remoteStreams: newStreams }
-                        })
-                    })
-                })
-                .subscribe(async (status: string) => {
-                    if (status === 'SUBSCRIBED') {
-                        // Track presence
-                        await channelRef.current.track({ user_id: user.id, online_at: new Date().toISOString() })
-                    }
-                })
-
-            // 4. Update DB State
-            await (supabase.from('voice_participants') as any).upsert({
-                channel_id: channelId,
-                user_id: user.id,
-                is_muted: false,
-                is_deafened: false
-            })
-
-            // 5. Update Local State
-            await fetchParticipants()
-            setState(prev => ({ ...prev, isConnected: true, localStream: stream }))
-
-            // 6. Listen for DB changes to sync participants UI
-            const dbSubscription = supabase.channel(`participants_sync_${channelId}`)
-                .on('postgres_changes', {
-                    event: '*',
-                    schema: 'public',
-                    table: 'voice_participants',
-                    filter: `channel_id=eq.${channelId}`
-                }, () => {
-                    fetchParticipants()
-                })
-                .subscribe()
-
-            // Store subscription for cleanup
-            if (channelRef.current) {
-                (channelRef.current as any).dbSub = dbSubscription;
-            }
-
-        } catch (err) {
-            console.error('Failed to join voice:', err)
-            cleanup()
-        }
-    }, [user, channelId, state.isConnected])
-
-    const initiateConnection = async (targetUserId: string) => {
-        const pc = createPeerConnection(targetUserId)
-        const offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        sendSignal('offer', offer, targetUserId)
-    }
-
-    const leaveVoice = () => cleanup()
-
-    const fetchParticipants = async () => {
-        if (!channelId) return
-        try {
-            console.log('Fetching participants for channel:', channelId)
-            const { data, error } = await (supabase.from('voice_participants') as any).select('*').eq('channel_id', channelId)
-
-            if (error) {
-                console.error('Supabase error fetching participants:', error)
-                return
-            }
-
-            if (data) {
-                console.log('Participants data found:', data.length)
-                const userIds = [...new Set(data.map((p: any) => p.user_id))]
-                const { data: users } = await (supabase.from('users') as any).select('*').in('id', userIds)
-
-                const usersMap: Record<string, User> = {}
-                if (users) users.forEach((u: any) => { usersMap[u.id] = u })
-
-                setState(prev => ({
-                    ...prev,
-                    participants: data.map((p: any) => ({ ...p, user: usersMap[p.user_id] }))
-                }))
-            }
-        } catch (err) {
-            console.error('Generic error in fetchParticipants:', err)
-        }
-    }
-
-    // Audio Analysis Loop
-    const detectSpeaking = () => {
-        if (!analyserRef.current || !user) return
-        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
-
-        let lastIsSpeaking = false
-
-        const check = () => {
-            if (!analyserRef.current) return
-            analyserRef.current.getByteFrequencyData(dataArray)
-            const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length
-
-            const isSpeaking = average > 30 // Threshold 
-
-            if (isSpeaking !== lastIsSpeaking) {
-                lastIsSpeaking = isSpeaking
-
-                // Update Local State
-                setState(prev => {
-                    const newSpeaking = new Set(prev.speakingUsers)
-                    if (isSpeaking) newSpeaking.add(user.id)
-                    else newSpeaking.delete(user.id)
-                    return { ...prev, speakingUsers: newSpeaking }
-                })
-
-                // Broadcast to others
-                sendSignal('speaking', { isSpeaking })
-            }
-
-            animationFrameRef.current = requestAnimationFrame(check)
-        }
-        check()
-    }
-
-    // Mute/Deafen Logic
-    const toggleMute = async () => {
-        if (!state.localStream || !user) return
-        const newMuted = !state.isMuted
-        state.localStream.getAudioTracks().forEach(t => t.enabled = !newMuted)
-        await (supabase.from('voice_participants') as any).update({ is_muted: newMuted }).eq('channel_id', channelId).eq('user_id', user.id)
-        setState(prev => ({ ...prev, isMuted: newMuted }))
-    }
-
-    const toggleDeafen = async () => {
-        if (!user || !channelId) return
-        // Toggle remote audio
-        state.remoteStreams.forEach(stream => {
-            stream.getAudioTracks().forEach(t => t.enabled = state.isDeafened)
-        })
-        const newDeafened = !state.isDeafened
-        await (supabase.from('voice_participants') as any).update({ is_deafened: newDeafened }).eq('channel_id', channelId).eq('user_id', user.id)
-        setState(prev => ({ ...prev, isDeafened: newDeafened }))
-    }
-
-    const startScreenShare = async () => {
-        if (!user || !channelId) return
-        try {
-            const screenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
-
-            // Replace video track in all peer connections
-            const videoTrack = screenStream.getVideoTracks()[0]
-
-            peersRef.current.forEach(pc => {
-                const sender = pc.getSenders().find(s => s.track?.kind === 'video')
-                if (sender) {
-                    sender.replaceTrack(videoTrack)
-                } else {
-                    pc.addTrack(videoTrack, screenStream)
+            localStreamRef.current?.getTracks().forEach((track) => {
+                if (localStreamRef.current) {
+                    peerConnection.addTrack(track, localStreamRef.current)
                 }
             })
 
-            // Handle stream stop (user clicks "Stop Sharing" in browser UI)
-            videoTrack.onended = () => stopScreenShare()
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                    void sendSignal('ice-candidate', event.candidate.toJSON(), targetUserId)
+                }
+            }
 
-            await (supabase.from('voice_participants') as any).update({ is_screen_sharing: true }).eq('channel_id', channelId).eq('user_id', user.id)
-            setState(prev => ({ ...prev, isScreenSharing: true }))
-        } catch (e) {
-            console.error(e)
+            peerConnection.ontrack = (event) => {
+                const stream = event.streams[0]
+                const incomingTrack = event.track
+                if (!stream || !incomingTrack) return
+
+                upsertRemoteTrack(targetUserId, incomingTrack)
+
+                if (stream.getAudioTracks().length === 0) return
+
+                if (!outputAudioContextRef.current) {
+                    outputAudioContextRef.current = new AudioContext()
+                }
+
+                disposeRemoteAudioController(targetUserId)
+
+                const outputContext = outputAudioContextRef.current
+                const sourceNode = outputContext.createMediaStreamSource(stream)
+                const gainNode = outputContext.createGain()
+                gainNode.gain.value = audioSettingsRef.current.outputVolume / 100
+
+                const destinationNode = outputContext.createMediaStreamDestination()
+                sourceNode.connect(gainNode)
+                gainNode.connect(destinationNode)
+
+                const audio = new Audio() as SinkableAudioElement
+                audio.srcObject = destinationNode.stream
+                audio.autoplay = true
+                audio.volume = 1
+                audio.muted = isDeafenedRef.current
+
+                stream.getAudioTracks().forEach((track) => {
+                    track.enabled = !isDeafenedRef.current
+                })
+
+                remoteAudioRefs.current.set(targetUserId, audio)
+                remoteAudioControllersRef.current.set(targetUserId, {
+                    audio,
+                    sourceNode,
+                    gainNode,
+                    destinationNode,
+                })
+
+                void setAudioSinkId(audio, audioSettingsRef.current.outputDeviceId)
+                void audio.play().catch(console.error)
+            }
+
+            peerConnection.onnegotiationneeded = async () => {
+                if (peerConnection.signalingState !== 'stable' || !isConnectedRef.current) return
+
+                try {
+                    const offer = await peerConnection.createOffer()
+                    if (peerConnection.signalingState !== 'stable') return
+                    await peerConnection.setLocalDescription(offer)
+                    await sendSignal('offer', offer, targetUserId)
+                } catch (error) {
+                    console.error('Negotiation Error:', error)
+                }
+            }
+
+            peersRef.current.set(targetUserId, peerConnection)
+            return peerConnection
+        },
+        [disposeRemoteAudioController, sendSignal, setAudioSinkId, upsertRemoteTrack],
+    )
+
+    const handleSignal = useCallback(
+        async (payload: VoiceSignalPayload) => {
+            const { type, fromUserId, data } = payload
+            if (!userId || fromUserId === userId) return
+
+            let peerConnection = peersRef.current.get(fromUserId)
+            if (!peerConnection && type === 'offer') {
+                peerConnection = createPeerConnection(fromUserId)
+            }
+            if (!peerConnection) return
+
+            try {
+                if (type === 'offer' && data) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data as RTCSessionDescriptionInit))
+                    const answer = await peerConnection.createAnswer()
+                    await peerConnection.setLocalDescription(answer)
+                    await sendSignal('answer', answer, fromUserId)
+                    return
+                }
+
+                if (type === 'answer' && data) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data as RTCSessionDescriptionInit))
+                    return
+                }
+
+                if (type === 'ice-candidate' && data) {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(data as RTCIceCandidateInit))
+                    return
+                }
+
+                if (type === 'speaking') {
+                    const speakingData = data as { isSpeaking: boolean } | null
+                    if (!speakingData) return
+
+                    setState((prev) => {
+                        const nextSpeakingUsers = new Set(prev.speakingUsers)
+                        if (speakingData.isSpeaking) nextSpeakingUsers.add(fromUserId)
+                        else nextSpeakingUsers.delete(fromUserId)
+                        return { ...prev, speakingUsers: nextSpeakingUsers }
+                    })
+                }
+            } catch (error) {
+                console.error('WebRTC Signal Error:', error)
+            }
+        },
+        [createPeerConnection, sendSignal, userId],
+    )
+
+    const fetchParticipants = useCallback(async () => {
+        if (!channelId) return
+
+        const { data, error } = await supabase.from('voice_participants').select('*').eq('channel_id', channelId)
+        if (error || !data) return
+
+        const typedParticipants = data as VoiceParticipantRow[]
+        const userIds = [...new Set(typedParticipants.map((participant) => participant.user_id))]
+        const usersMap: Record<string, User> = {}
+
+        if (userIds.length > 0) {
+            const { data: users } = await supabase.from('users').select('*').in('id', userIds)
+            ;(users as UserRow[] | null)?.forEach((userRow) => {
+                usersMap[userRow.id] = toPublicUser(userRow)
+            })
         }
-    }
 
-    const stopScreenShare = async () => {
-        if (!user || !channelId) return
+        setState((prev) => ({
+            ...prev,
+            participants: typedParticipants.map((participant: VoiceParticipantRow) => ({
+                ...participant,
+                user: usersMap[participant.user_id],
+            })),
+        }))
+    }, [channelId])
 
-        // Remove video tracks
-        peersRef.current.forEach(pc => {
-            const sender = pc.getSenders().find(s => s.track?.kind === 'video')
+    const detectSpeaking = useCallback(() => {
+        if (!analyserRef.current || !userId) return
+
+        const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+        let wasSpeaking = false
+
+        const tick = () => {
+            if (!analyserRef.current) return
+
+            analyserRef.current.getByteFrequencyData(dataArray)
+            const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length
+            const isSpeaking = !isMutedRef.current && !isDeafenedRef.current && average > 30
+
+            if (isSpeaking !== wasSpeaking) {
+                wasSpeaking = isSpeaking
+
+                setState((prev) => {
+                    const nextSpeakingUsers = new Set(prev.speakingUsers)
+                    if (isSpeaking) nextSpeakingUsers.add(userId)
+                    else nextSpeakingUsers.delete(userId)
+                    return { ...prev, speakingUsers: nextSpeakingUsers }
+                })
+
+                void sendSignal('speaking', { isSpeaking })
+            }
+
+            animationFrameRef.current = requestAnimationFrame(tick)
+        }
+
+        tick()
+    }, [sendSignal, userId])
+
+    const clearLocalSpeaking = useCallback(() => {
+        if (!userId) return
+
+        setState((prev) => {
+            const nextSpeakingUsers = new Set(prev.speakingUsers)
+            nextSpeakingUsers.delete(userId)
+            return { ...prev, speakingUsers: nextSpeakingUsers }
+        })
+
+        void sendSignal('speaking', { isSpeaking: false })
+    }, [sendSignal, userId])
+
+
+    const initiateConnection = useCallback(
+        async (targetUserId: string) => {
+            const peerConnection = createPeerConnection(targetUserId)
+            const offer = await peerConnection.createOffer()
+            await peerConnection.setLocalDescription(offer)
+            await sendSignal('offer', offer, targetUserId)
+        },
+        [createPeerConnection, sendSignal],
+    )
+
+    const joinVoice = useCallback(async () => {
+        if (!userId || !channelId || isConnectedRef.current || isJoiningRef.current) return
+
+        const attemptId = joinAttemptRef.current + 1
+        joinAttemptRef.current = attemptId
+        isJoiningRef.current = true
+        let joinedSignalChannel: RealtimeChannel | null = null
+        let joinedParticipantsSyncChannel: RealtimeChannel | null = null
+        let joinedRawStream: MediaStream | null = null
+        let joinedOutboundStream: MediaStream | null = null
+        let joinedAudioContext: AudioContext | null = null
+        let joinedAnalyser: AnalyserNode | null = null
+        let joinedMicrophoneGain: GainNode | null = null
+
+        const isStaleAttempt = () => joinAttemptRef.current !== attemptId
+        const disposeJoinAttemptResources = async () => {
+            if (joinedParticipantsSyncChannel && participantsSyncChannelRef.current !== joinedParticipantsSyncChannel) {
+                await joinedParticipantsSyncChannel.unsubscribe()
+            }
+            if (joinedSignalChannel && signalChannelRef.current !== joinedSignalChannel) {
+                await joinedSignalChannel.unsubscribe()
+            }
+            if (joinedAudioContext && audioContextRef.current !== joinedAudioContext) {
+                await joinedAudioContext.close()
+            }
+
+            const handledStreams = new Set<MediaStream>()
+            ;[joinedOutboundStream, joinedRawStream].forEach((stream) => {
+                if (!stream || handledStreams.has(stream)) return
+                handledStreams.add(stream)
+                stream.getTracks().forEach((track) => track.stop())
+            })
+        }
+
+        try {
+            const currentAudioSettings = getSavedAudioSettings()
+            audioSettingsRef.current = currentAudioSettings
+
+            const stream = await requestVoiceStream(currentAudioSettings)
+
+            joinedRawStream = stream
+            joinedOutboundStream = stream
+
+            if (stream.getAudioTracks().length > 0) {
+                try {
+                    const inputAudioContext = new AudioContext()
+                    joinedAudioContext = inputAudioContext
+                    const source = inputAudioContext.createMediaStreamSource(stream)
+                    const microphoneGain = inputAudioContext.createGain()
+                    microphoneGain.gain.value = currentAudioSettings.inputVolume / 100
+                    joinedMicrophoneGain = microphoneGain
+
+                    const analyser = inputAudioContext.createAnalyser()
+                    analyser.fftSize = 256
+                    joinedAnalyser = analyser
+                    const destination = inputAudioContext.createMediaStreamDestination()
+
+                    source.connect(microphoneGain)
+                    microphoneGain.connect(analyser)
+                    microphoneGain.connect(destination)
+                    joinedOutboundStream = destination.stream
+                } catch (error) {
+                    console.error('Audio analysis setup failed:', error)
+                }
+            }
+
+            if (isStaleAttempt()) {
+                await disposeJoinAttemptResources()
+                return
+            }
+
+            rawLocalStreamRef.current = joinedRawStream
+            localStreamRef.current = joinedOutboundStream
+            audioContextRef.current = joinedAudioContext
+            analyserRef.current = joinedAnalyser
+            microphoneGainRef.current = joinedMicrophoneGain
+
+            if (joinedAnalyser) {
+                detectSpeaking()
+            }
+
+            const signalChannel = supabase.channel(`voice:${channelId}`, {
+                config: { broadcast: { self: false } },
+            })
+            joinedSignalChannel = signalChannel
+            signalChannelRef.current = signalChannel
+
+            signalChannel
+                .on('broadcast', { event: 'signal' }, ({ payload }: VoiceBroadcastEnvelope) => {
+                    if (!payload.toUserId || payload.toUserId === userId) {
+                        void handleSignal(payload)
+                    }
+                })
+                .on('presence', { event: 'join' }, ({ newPresences }: { newPresences: PresenceUser[] }) => {
+                    newPresences.forEach((presence) => {
+                        if (presence.user_id !== userId) {
+                            void initiateConnection(presence.user_id)
+                        }
+                    })
+                })
+                .on('presence', { event: 'leave' }, ({ leftPresences }: { leftPresences: PresenceUser[] }) => {
+                    leftPresences.forEach((presence) => {
+                        const peerConnection = peersRef.current.get(presence.user_id)
+                        peerConnection?.close()
+                        peersRef.current.delete(presence.user_id)
+
+                        disposeRemoteAudioController(presence.user_id)
+
+                        setState((prev) => {
+                            const nextStreams = new Map(prev.remoteStreams)
+                            nextStreams.delete(presence.user_id)
+                            return { ...prev, remoteStreams: nextStreams }
+                        })
+                    })
+                })
+                .subscribe(async (status) => {
+                    if (status === 'SUBSCRIBED') {
+                        await signalChannel.track({ user_id: userId, online_at: new Date().toISOString() })
+                    }
+                })
+
+            if (isStaleAttempt()) {
+                await disposeJoinAttemptResources()
+                return
+            }
+
+            const { error: upsertError } = await withTimeout(
+                supabase.from('voice_participants').upsert({
+                    channel_id: channelId,
+                    user_id: userId,
+                    is_muted: false,
+                    is_deafened: false,
+                } as never),
+                3000,
+                'voice participant upsert',
+            )
+            if (upsertError) throw upsertError
+
+            if (isStaleAttempt()) {
+                await disposeJoinAttemptResources()
+                return
+            }
+
+            isConnectedRef.current = true
+            setState((prev) => ({ ...prev, isConnected: true, localStream: joinedOutboundStream }))
+            void fetchParticipants()
+
+            const participantsSyncChannel = supabase
+                .channel(`participants_sync_${channelId}`)
+                .on(
+                    'postgres_changes',
+                    {
+                        event: '*',
+                        schema: 'public',
+                        table: 'voice_participants',
+                        filter: `channel_id=eq.${channelId}`,
+                    },
+                    () => {
+                        void fetchParticipants()
+                    },
+                )
+                .subscribe()
+
+            joinedParticipantsSyncChannel = participantsSyncChannel
+            if (isStaleAttempt()) {
+                await disposeJoinAttemptResources()
+                return
+            }
+
+            participantsSyncChannelRef.current = participantsSyncChannel
+
+            if (joinRetryIntervalRef.current !== null) {
+                window.clearInterval(joinRetryIntervalRef.current)
+                joinRetryIntervalRef.current = null
+            }
+        } catch (error) {
+            if (isStaleAttempt()) {
+                await disposeJoinAttemptResources()
+                return
+            }
+            console.error('Failed to join voice channel:', error)
+            await cleanup()
+        } finally {
+            if (!isStaleAttempt()) {
+                isJoiningRef.current = false
+            }
+        }
+    }, [
+        userId,
+        channelId,
+        cleanup,
+        detectSpeaking,
+        disposeRemoteAudioController,
+        fetchParticipants,
+        handleSignal,
+        initiateConnection,
+        requestVoiceStream,
+        withTimeout,
+    ])
+
+    const leaveVoice = useCallback(async () => {
+        await cleanup()
+    }, [cleanup])
+
+    const toggleMute = useCallback(async () => {
+        if (!userId || !channelId) return
+
+        const previousMuted = isMutedRef.current
+        const nextMuted = !previousMuted
+        isMutedRef.current = nextMuted
+        state.localStream?.getAudioTracks().forEach((track) => {
+            track.enabled = !nextMuted
+        })
+
+        if (nextMuted) {
+            clearLocalSpeaking()
+        }
+
+        setState((prev) => ({
+            ...prev,
+            isMuted: nextMuted,
+            participants: prev.participants.map((participant) =>
+                participant.user_id === userId ? { ...participant, is_muted: nextMuted } : participant,
+            ),
+        }))
+
+        muteOperationRef.current += 1
+        const operationId = muteOperationRef.current
+        const updated = await updateParticipantState({ is_muted: nextMuted })
+        if (updated || operationId !== muteOperationRef.current) return
+
+        isMutedRef.current = previousMuted
+        state.localStream?.getAudioTracks().forEach((track) => {
+            track.enabled = !previousMuted
+        })
+        setState((prev) => ({
+            ...prev,
+            isMuted: previousMuted,
+            participants: prev.participants.map((participant) =>
+                participant.user_id === userId ? { ...participant, is_muted: previousMuted } : participant,
+            ),
+        }))
+    }, [clearLocalSpeaking, state.localStream, userId, channelId, updateParticipantState])
+
+    const toggleDeafen = useCallback(async () => {
+        if (!userId || !channelId) return
+
+        const previousDeafened = isDeafenedRef.current
+        const previousMuted = isMutedRef.current
+        const nextDeafened = !previousDeafened
+        const nextMuted = nextDeafened
+        isDeafenedRef.current = nextDeafened
+        isMutedRef.current = nextMuted
+        muteOperationRef.current += 1
+        state.remoteStreams.forEach((stream) => {
+            stream.getAudioTracks().forEach((track) => {
+                track.enabled = !nextDeafened
+            })
+        })
+        state.localStream?.getAudioTracks().forEach((track) => {
+            track.enabled = !nextMuted
+        })
+        remoteAudioRefs.current.forEach((audio) => {
+            audio.muted = nextDeafened
+        })
+
+        if (nextDeafened || nextMuted) {
+            clearLocalSpeaking()
+        }
+
+        setState((prev) => ({
+            ...prev,
+            isMuted: nextMuted,
+            isDeafened: nextDeafened,
+            participants: prev.participants.map((participant) =>
+                participant.user_id === userId
+                    ? { ...participant, is_muted: nextMuted, is_deafened: nextDeafened }
+                    : participant,
+            ),
+        }))
+
+        deafenOperationRef.current += 1
+        const operationId = deafenOperationRef.current
+        const updated = await updateParticipantState({ is_muted: nextMuted, is_deafened: nextDeafened })
+        if (updated || operationId !== deafenOperationRef.current) return
+
+        isDeafenedRef.current = previousDeafened
+        isMutedRef.current = previousMuted
+        state.remoteStreams.forEach((stream) => {
+            stream.getAudioTracks().forEach((track) => {
+                track.enabled = !previousDeafened
+            })
+        })
+        state.localStream?.getAudioTracks().forEach((track) => {
+            track.enabled = !previousMuted
+        })
+        remoteAudioRefs.current.forEach((audio) => {
+            audio.muted = previousDeafened
+        })
+        setState((prev) => ({
+            ...prev,
+            isMuted: previousMuted,
+            isDeafened: previousDeafened,
+            participants: prev.participants.map((participant) =>
+                participant.user_id === userId
+                    ? { ...participant, is_muted: previousMuted, is_deafened: previousDeafened }
+                    : participant,
+            ),
+        }))
+    }, [clearLocalSpeaking, state.remoteStreams, state.localStream, userId, channelId, updateParticipantState])
+
+    const getScreenShareStream = useCallback(async () => {
+        return navigator.mediaDevices.getDisplayMedia({
+            video: {
+                width: { ideal: 1920, max: 1920 },
+                height: { ideal: 1080, max: 1080 },
+                frameRate: { ideal: 60, max: 60 },
+            },
+            audio: false,
+        })
+    }, [])
+
+    const stopScreenShare = useCallback(async () => {
+        if (!userId || !channelId) return
+
+        peersRef.current.forEach((peerConnection) => {
+            const sender = peerConnection.getSenders().find((candidate) => candidate.track?.kind === 'video')
             if (sender) {
-                pc.removeTrack(sender)
+                peerConnection.removeTrack(sender)
             }
         })
 
-        await (supabase.from('voice_participants') as any).update({ is_screen_sharing: false }).eq('channel_id', channelId).eq('user_id', user.id)
-        setState(prev => ({ ...prev, isScreenSharing: false }))
-    }
+        if (screenShareStreamRef.current) {
+            screenShareStreamRef.current.getTracks().forEach((track) => track.stop())
+            screenShareStreamRef.current = null
+        }
 
-    // Auto-join/leave based on channelId
+        const updated = await updateParticipantState({ is_screen_sharing: false })
+        if (!updated) return
+
+        setState((prev) => ({ ...prev, isScreenSharing: false, screenShareStream: null }))
+    }, [userId, channelId, updateParticipantState])
+
+    const startScreenShare = useCallback(async () => {
+        if (!userId || !channelId || state.isScreenSharing) return
+
+        try {
+            const screenStream = await getScreenShareStream()
+            const videoTrack = screenStream.getVideoTracks()[0]
+
+            if (!videoTrack) {
+                screenStream.getTracks().forEach((track) => track.stop())
+                return
+            }
+
+            videoTrack.contentHint = 'detail'
+            screenShareStreamRef.current = screenStream
+
+            peersRef.current.forEach((peerConnection) => {
+                const sender = peerConnection.getSenders().find((candidate) => candidate.track?.kind === 'video')
+                if (sender) {
+                    void sender.replaceTrack(videoTrack)
+                } else {
+                    peerConnection.addTrack(videoTrack, screenStream)
+                }
+            })
+
+            videoTrack.onended = () => {
+                void stopScreenShare()
+            }
+
+            const updated = await updateParticipantState({ is_screen_sharing: true })
+            if (!updated) {
+                screenStream.getTracks().forEach((track) => track.stop())
+                screenShareStreamRef.current = null
+                return
+            }
+
+            setState((prev) => ({ ...prev, isScreenSharing: true, screenShareStream: screenStream }))
+        } catch (error) {
+            if (error instanceof Error && error.name === 'AbortError') return
+
+            const message = error instanceof Error ? error.message : 'Ekran paylasimi baslatilamadi.'
+            console.error('Screen share failed:', error)
+            window.alert(message)
+        }
+    }, [userId, channelId, getScreenShareStream, state.isScreenSharing, stopScreenShare, updateParticipantState])
+
+    useEffect(() => {
+        const handleAudioSettingsChange = (event: Event) => {
+            const nextSettings = (event as CustomEvent<AudioSettings>).detail ?? getSavedAudioSettings()
+            audioSettingsRef.current = nextSettings
+            void applyInputAudioSettings(nextSettings)
+            void applyOutputAudioSettings(nextSettings)
+        }
+
+        window.addEventListener(AUDIO_SETTINGS_CHANGE_EVENT, handleAudioSettingsChange as EventListener)
+        return () => {
+            window.removeEventListener(AUDIO_SETTINGS_CHANGE_EVENT, handleAudioSettingsChange as EventListener)
+        }
+    }, [applyInputAudioSettings, applyOutputAudioSettings])
+
     useEffect(() => {
         if (channelId) {
-            joinVoice()
+            void joinVoice()
+            if (joinRetryIntervalRef.current !== null) {
+                window.clearInterval(joinRetryIntervalRef.current)
+            }
+            joinRetryIntervalRef.current = window.setInterval(() => {
+                if (!isConnectedRef.current && !isJoiningRef.current) {
+                    void joinVoice()
+                }
+            }, 1500)
         } else {
-            cleanup()
+            void cleanup()
         }
-        return () => { cleanup() }
+
+        return () => {
+            void cleanup()
+        }
     }, [channelId, joinVoice, cleanup])
 
     return {
@@ -437,6 +1010,7 @@ export function useVoice(channelId: string | null) {
         toggleMute,
         toggleDeafen,
         startScreenShare,
-        stopScreenShare
+        stopScreenShare,
     }
 }
+

@@ -1,14 +1,66 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+﻿import { useState, useEffect, useCallback, useRef } from 'react'
+import type { RealtimePostgresDeletePayload, RealtimePostgresInsertPayload } from '@supabase/supabase-js'
 import { supabase } from '@/lib/supabase'
-import type { Message, User } from '@/types'
+import type { Message, MessageRow, User, UserRow } from '@/types'
 import { useAuthStore } from '@/stores'
+
+function toPublicUser(userRow: UserRow): User {
+    const { password_hash, ...publicUser } = userRow
+    void password_hash
+    return publicUser
+}
 
 export function useMessages(channelId: string | null) {
     const [messages, setMessages] = useState<Message[]>([])
     const [loading, setLoading] = useState(false)
     const [usersCache, setUsersCache] = useState<Record<string, User>>({})
-    const { user } = useAuthStore()
+    const user = useAuthStore((state) => state.user)
     const messagesEndRef = useRef<HTMLDivElement>(null)
+    const usersCacheRef = useRef<Record<string, User>>({})
+
+    useEffect(() => {
+        usersCacheRef.current = usersCache
+    }, [usersCache])
+
+    const fetchMessages = useCallback(async () => {
+        if (!channelId) return
+
+        setLoading(true)
+
+        const { data, error } = await supabase.from('messages')
+            .select('*')
+            .eq('channel_id', channelId)
+            .order('created_at', { ascending: true })
+            .limit(100)
+
+        if (!error && data) {
+            const typedMessages = data as MessageRow[]
+            const userIds = [...new Set(typedMessages.map((message) => message.user_id))]
+            let usersMap: Record<string, User> = {}
+
+            if (userIds.length > 0) {
+                const { data: users } = await supabase.from('users').select('*').in('id', userIds)
+
+                if (users) {
+                    usersMap = (users as UserRow[]).reduce<Record<string, User>>((acc, userRow) => {
+                        acc[userRow.id] = toPublicUser(userRow)
+                        return acc
+                    }, {})
+                }
+            }
+
+            setUsersCache((prev) => ({ ...prev, ...usersMap }))
+
+            const messagesWithUsers: Message[] = typedMessages.map((message) => ({
+                ...message,
+                user: usersMap[message.user_id] ?? usersCacheRef.current[message.user_id],
+            }))
+
+            setMessages(messagesWithUsers)
+        }
+
+        setLoading(false)
+    }, [channelId])
 
     // Fetch messages when channel changes
     useEffect(() => {
@@ -17,142 +69,88 @@ export function useMessages(channelId: string | null) {
             return
         }
 
-        fetchMessages()
+        void fetchMessages()
 
-        // Subscribe to new messages
         const subscription = supabase
             .channel(`messages:${channelId}`)
-            .on('postgres_changes', {
-                event: 'INSERT',
-                schema: 'public',
-                table: 'messages',
-                filter: `channel_id=eq.${channelId}`
-            }, async (payload) => {
-                const newMessage = payload.new as Message
+            .on(
+                'postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'messages',
+                    filter: `channel_id=eq.${channelId}`,
+                },
+                async (payload: RealtimePostgresInsertPayload<MessageRow>) => {
+                    const newMessage: Message = payload.new
 
-                // Get user info if not cached
-                if (!usersCache[newMessage.user_id]) {
-                    const { data: userData } = await supabase
-                        .from('users')
-                        .select('*')
-                        .eq('id', newMessage.user_id)
-                        .single()
+                    const cachedUser = usersCacheRef.current[newMessage.user_id]
+                    if (!cachedUser) {
+                        const { data: userData } = await supabase.from('users')
+                            .select('*')
+                            .eq('id', newMessage.user_id)
+                            .maybeSingle()
 
-                    if (userData) {
-                        setUsersCache(prev => ({ ...prev, [newMessage.user_id]: userData }))
-                        newMessage.user = userData
+                        if (userData) {
+                            const publicUser = toPublicUser(userData as UserRow)
+                            setUsersCache((prev) => ({ ...prev, [newMessage.user_id]: publicUser }))
+                            newMessage.user = publicUser
+                        }
+                    } else {
+                        newMessage.user = cachedUser
                     }
-                } else {
-                    newMessage.user = usersCache[newMessage.user_id]
-                }
 
-                setMessages(prev => [...prev, newMessage])
-            })
-            .on('postgres_changes', {
-                event: 'DELETE',
-                schema: 'public',
-                table: 'messages',
-                filter: `channel_id=eq.${channelId}`
-            }, (payload) => {
-                setMessages(prev => prev.filter(m => m.id !== payload.old.id))
-            })
+                    setMessages((prev) => {
+                        if (prev.some((message) => message.id === newMessage.id)) return prev
+                        return [...prev, newMessage]
+                    })
+                },
+            )
+            .on(
+                'postgres_changes',
+                {
+                    event: 'DELETE',
+                    schema: 'public',
+                    table: 'messages',
+                    filter: `channel_id=eq.${channelId}`,
+                },
+                (payload: RealtimePostgresDeletePayload<MessageRow>) => {
+                    setMessages((prev) => prev.filter((message) => message.id !== payload.old.id))
+                },
+            )
             .subscribe()
 
         return () => {
-            subscription.unsubscribe()
+            void subscription.unsubscribe()
         }
-    }, [channelId])
+    }, [channelId, fetchMessages])
 
     // Scroll to bottom on new messages
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
     }, [messages])
 
-    const fetchMessages = async () => {
-        if (!channelId) return
+    const sendMessage = useCallback(
+        async (content: string) => {
+            if (!user || !channelId || !content.trim()) return { success: false }
 
-        setLoading(true)
-
-        // Fetch messages with user info
-        const { data, error } = await supabase
-            .from('messages')
-            .select('*')
-            .eq('channel_id', channelId)
-            .order('created_at', { ascending: true })
-            .limit(100)
-
-        if (!error && data) {
-            // Fetch user info for all unique user IDs
-            const userIds = [...new Set((data as any[]).map((m: any) => m.user_id))]
-            const { data: users } = await supabase
-                .from('users')
-                .select('*')
-                .in('id', userIds)
-
-            const usersMap: Record<string, User> = {}
-            if (users) {
-                (users as any[]).forEach((u: any) => {
-                    usersMap[u.id] = u
-                })
-            }
-            setUsersCache(prev => ({ ...prev, ...usersMap }))
-
-            // Attach user info to messages
-            const messagesWithUsers = (data as any[]).map((m: any) => ({
-                ...m,
-                user: usersMap[m.user_id]
-            }))
-
-            setMessages(messagesWithUsers as any)
-        }
-
-        setLoading(false)
-    }
-
-    const sendMessage = useCallback(async (content: string) => {
-        if (!user || !channelId || !content.trim()) return { success: false }
-
-        const tempId = crypto.randomUUID()
-        const newMessage: Message = {
-            id: tempId,
-            channel_id: channelId,
-            user_id: user.id,
-            content: content.trim(),
-            created_at: new Date().toISOString(),
-            user: user
-        }
-
-        // Optimistic Update
-        setMessages(prev => [...prev, newMessage])
-
-        const { data, error } = await (supabase.from('messages') as any)
-            .insert({
+            const { error } = await supabase.from('messages').insert({
                 channel_id: channelId,
                 user_id: user.id,
-                content: content.trim()
-            })
-            .select()
-            .single()
+                content: content.trim(),
+            } as never)
 
-        if (error) {
-            // Rollback on error
-            setMessages(prev => prev.filter(m => m.id !== tempId))
-            return { success: false, error: error.message }
-        }
+            if (error) {
+                return { success: false, error: error.message }
+            }
 
-        // Replace temp ID with real ID (optional, but good for consistency)
-        if (data) {
-            setMessages(prev => prev.map(m => m.id === tempId ? { ...m, id: (data as any).id } : m))
-        }
-
-        return { success: true }
-    }, [user, channelId])
+            return { success: true }
+        },
+        [user, channelId],
+    )
 
     const deleteMessage = useCallback(async (messageId: string) => {
-        const { error } = await supabase
-            .from('messages')
-            .delete()
-            .eq('id', messageId)
+        const { error } = await supabase.from('messages').delete().eq('id', messageId)
 
         if (error) {
             return { success: false, error: error.message }
@@ -167,7 +165,7 @@ export function useMessages(channelId: string | null) {
 
     const clearChannelMessages = useCallback(async () => {
         if (!channelId) return
-        await (supabase.from('messages') as any).delete().eq('channel_id', channelId)
+        await supabase.from('messages').delete().eq('channel_id', channelId)
     }, [channelId])
 
     return {
@@ -177,6 +175,7 @@ export function useMessages(channelId: string | null) {
         deleteMessage,
         clearMessages,
         clearChannelMessages,
-        messagesEndRef
+        messagesEndRef,
     }
 }
+

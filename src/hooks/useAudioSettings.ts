@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 
-interface AudioSettings {
+export interface AudioSettings {
     inputVolume: number
     outputVolume: number
     inputDeviceId: string
@@ -9,26 +9,58 @@ interface AudioSettings {
     echoCancellation: boolean
 }
 
+type SinkableAudioElement = HTMLAudioElement & {
+    setSinkId?: (deviceId: string) => Promise<void>
+}
+
+export const AUDIO_SETTINGS_STORAGE_KEY = 'cshub-audio-settings'
+export const AUDIO_SETTINGS_CHANGE_EVENT = 'cshub-audio-settings-changed'
+
 const defaultSettings: AudioSettings = {
     inputVolume: 100,
     outputVolume: 100,
     inputDeviceId: 'default',
     outputDeviceId: 'default',
     noiseSuppression: true,
-    echoCancellation: true
+    echoCancellation: true,
+}
+
+export function getSavedAudioSettings(): AudioSettings {
+    if (typeof window === 'undefined') return defaultSettings
+
+    const saved = window.localStorage.getItem(AUDIO_SETTINGS_STORAGE_KEY)
+    if (!saved) return defaultSettings
+
+    try {
+        return { ...defaultSettings, ...(JSON.parse(saved) as Partial<AudioSettings>) }
+    } catch {
+        return defaultSettings
+    }
+}
+
+function persistAudioSettings(nextSettings: AudioSettings) {
+    if (typeof window === 'undefined') return
+
+    window.localStorage.setItem(AUDIO_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings))
+    window.dispatchEvent(new CustomEvent<AudioSettings>(AUDIO_SETTINGS_CHANGE_EVENT, { detail: nextSettings }))
+}
+
+async function applySinkId(audio: SinkableAudioElement, outputDeviceId: string) {
+    if (typeof audio.setSinkId !== 'function') return
+
+    try {
+        await audio.setSinkId(outputDeviceId === 'default' ? '' : outputDeviceId)
+    } catch (error) {
+        console.error('Failed to set output device:', error)
+    }
 }
 
 export function useAudioSettings() {
-    const [settings, setSettings] = useState<AudioSettings>(() => {
-        const saved = localStorage.getItem('cshub-audio-settings')
-        return saved ? JSON.parse(saved) : defaultSettings
-    })
-
+    const [settings, setSettings] = useState<AudioSettings>(getSavedAudioSettings)
     const [devices, setDevices] = useState<{
         inputs: MediaDeviceInfo[]
         outputs: MediaDeviceInfo[]
     }>({ inputs: [], outputs: [] })
-
     const [isTesting, setIsTesting] = useState(false)
     const [micLevel, setMicLevel] = useState(0)
 
@@ -36,116 +68,180 @@ export function useAudioSettings() {
     const audioContextRef = useRef<AudioContext | null>(null)
     const analyserRef = useRef<AnalyserNode | null>(null)
     const animationRef = useRef<number | null>(null)
+    const testInputGainRef = useRef<GainNode | null>(null)
+    const testOutputGainRef = useRef<GainNode | null>(null)
+    const testMonitorAudioRef = useRef<SinkableAudioElement | null>(null)
+    const testConstraintKeyRef = useRef(
+        `${settings.inputDeviceId}|${settings.noiseSuppression}|${settings.echoCancellation}`,
+    )
 
-    // Save settings to localStorage
-    useEffect(() => {
-        localStorage.setItem('cshub-audio-settings', JSON.stringify(settings))
-    }, [settings])
-
-    // Get available devices
     useEffect(() => {
         const getDevices = async () => {
             try {
-                // Request permission first
-                await navigator.mediaDevices.getUserMedia({ audio: true })
-                    .then(stream => stream.getTracks().forEach(t => t.stop()))
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
+                stream.getTracks().forEach((track) => track.stop())
 
                 const deviceList = await navigator.mediaDevices.enumerateDevices()
-
                 setDevices({
-                    inputs: deviceList.filter(d => d.kind === 'audioinput'),
-                    outputs: deviceList.filter(d => d.kind === 'audiooutput')
+                    inputs: deviceList.filter((device) => device.kind === 'audioinput'),
+                    outputs: deviceList.filter((device) => device.kind === 'audiooutput'),
                 })
-            } catch (err) {
-                console.error('Failed to get devices:', err)
+            } catch (error) {
+                console.error('Failed to get devices:', error)
             }
         }
 
-        getDevices()
-
+        void getDevices()
         navigator.mediaDevices.addEventListener('devicechange', getDevices)
+
         return () => {
             navigator.mediaDevices.removeEventListener('devicechange', getDevices)
         }
     }, [])
 
-    const updateSetting = useCallback(<K extends keyof AudioSettings>(
-        key: K,
-        value: AudioSettings[K]
-    ) => {
-        setSettings(prev => ({ ...prev, [key]: value }))
+    const updateSetting = useCallback(<K extends keyof AudioSettings>(key: K, value: AudioSettings[K]) => {
+        setSettings((previousSettings) => {
+            const nextSettings = { ...previousSettings, [key]: value }
+            persistAudioSettings(nextSettings)
+            return nextSettings
+        })
+    }, [])
+
+    const resetSettings = useCallback(() => {
+        setSettings(defaultSettings)
+        persistAudioSettings(defaultSettings)
+    }, [])
+
+    const stopMicTest = useCallback(() => {
+        testStreamRef.current?.getTracks().forEach((track) => track.stop())
+        testStreamRef.current = null
+
+        if (animationRef.current !== null) {
+            cancelAnimationFrame(animationRef.current)
+            animationRef.current = null
+        }
+
+        if (testMonitorAudioRef.current) {
+            testMonitorAudioRef.current.pause()
+            testMonitorAudioRef.current.srcObject = null
+            testMonitorAudioRef.current = null
+        }
+
+        if (audioContextRef.current) {
+            void audioContextRef.current.close()
+            audioContextRef.current = null
+        }
+
+        testInputGainRef.current = null
+        testOutputGainRef.current = null
+        analyserRef.current = null
+        setIsTesting(false)
+        setMicLevel(0)
     }, [])
 
     const startMicTest = useCallback(async () => {
+        stopMicTest()
+
         try {
             const stream = await navigator.mediaDevices.getUserMedia({
                 audio: {
-                    deviceId: settings.inputDeviceId !== 'default'
-                        ? { exact: settings.inputDeviceId }
-                        : undefined,
+                    deviceId: settings.inputDeviceId !== 'default' ? { exact: settings.inputDeviceId } : undefined,
                     noiseSuppression: settings.noiseSuppression,
-                    echoCancellation: settings.echoCancellation
-                }
+                    echoCancellation: settings.echoCancellation,
+                    autoGainControl: true,
+                },
             })
 
             testStreamRef.current = stream
 
-            // Create audio context for level monitoring
-            audioContextRef.current = new AudioContext()
-            const source = audioContextRef.current.createMediaStreamSource(stream)
+            const audioContext = new AudioContext()
+            audioContextRef.current = audioContext
 
-            // Create gain node for volume control
-            const gainNode = audioContextRef.current.createGain()
-            gainNode.gain.value = settings.inputVolume / 100
+            const source = audioContext.createMediaStreamSource(stream)
+            const inputGain = audioContext.createGain()
+            inputGain.gain.value = settings.inputVolume / 100
+            testInputGainRef.current = inputGain
 
-            analyserRef.current = audioContextRef.current.createAnalyser()
-            analyserRef.current.fftSize = 256
+            const analyser = audioContext.createAnalyser()
+            analyser.fftSize = 256
+            analyserRef.current = analyser
 
-            source.connect(gainNode)
-            gainNode.connect(analyserRef.current)
+            const outputGain = audioContext.createGain()
+            outputGain.gain.value = settings.outputVolume / 100
+            testOutputGainRef.current = outputGain
 
-            // Connect to output for self-hearing (loopback)
-            analyserRef.current.connect(audioContextRef.current.destination)
+            const monitorDestination = audioContext.createMediaStreamDestination()
+            const monitorAudio = new Audio() as SinkableAudioElement
+            monitorAudio.srcObject = monitorDestination.stream
+            monitorAudio.autoplay = true
+            monitorAudio.volume = 1
+            await applySinkId(monitorAudio, settings.outputDeviceId)
+            testMonitorAudioRef.current = monitorAudio
+
+            source.connect(inputGain)
+            inputGain.connect(analyser)
+            inputGain.connect(outputGain)
+            outputGain.connect(monitorDestination)
+
+            await monitorAudio.play().catch((error) => {
+                console.error('Mic monitor playback failed:', error)
+            })
 
             setIsTesting(true)
 
-            // Monitor mic level
-            const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount)
+            const dataArray = new Uint8Array(analyser.frequencyBinCount)
             const checkLevel = () => {
                 if (!analyserRef.current) return
 
                 analyserRef.current.getByteFrequencyData(dataArray)
-                const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length
+                const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length
                 const normalized = Math.min(100, (average / 128) * 100)
                 setMicLevel(normalized)
 
                 animationRef.current = requestAnimationFrame(checkLevel)
             }
+
             checkLevel()
-
-        } catch (err) {
-            console.error('Mic test failed:', err)
+        } catch (error) {
+            console.error('Mic test failed:', error)
+            stopMicTest()
         }
-    }, [settings])
+    }, [settings, stopMicTest])
 
-    const stopMicTest = useCallback(() => {
-        testStreamRef.current?.getTracks().forEach(t => t.stop())
-        testStreamRef.current = null
-
-        if (animationRef.current) {
-            cancelAnimationFrame(animationRef.current)
-            animationRef.current = null
+    useEffect(() => {
+        if (testInputGainRef.current) {
+            testInputGainRef.current.gain.value = settings.inputVolume / 100
         }
+    }, [settings.inputVolume])
 
-        audioContextRef.current?.close()
-        audioContextRef.current = null
-        analyserRef.current = null
+    useEffect(() => {
+        if (testOutputGainRef.current) {
+            testOutputGainRef.current.gain.value = settings.outputVolume / 100
+        }
+    }, [settings.outputVolume])
 
-        setIsTesting(false)
-        setMicLevel(0)
-    }, [])
+    useEffect(() => {
+        if (testMonitorAudioRef.current) {
+            void applySinkId(testMonitorAudioRef.current, settings.outputDeviceId)
+        }
+    }, [settings.outputDeviceId])
 
-    // Cleanup on unmount
+    useEffect(() => {
+        const constraintKey = `${settings.inputDeviceId}|${settings.noiseSuppression}|${settings.echoCancellation}`
+        const previousKey = testConstraintKeyRef.current
+        testConstraintKeyRef.current = constraintKey
+
+        if (isTesting && previousKey !== constraintKey) {
+            void startMicTest()
+        }
+    }, [
+        isTesting,
+        settings.inputDeviceId,
+        settings.noiseSuppression,
+        settings.echoCancellation,
+        startMicTest,
+    ])
+
     useEffect(() => {
         return () => {
             stopMicTest()
@@ -160,6 +256,6 @@ export function useAudioSettings() {
         updateSetting,
         startMicTest,
         stopMicTest,
-        resetSettings: () => setSettings(defaultSettings)
+        resetSettings,
     }
 }

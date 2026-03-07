@@ -1,81 +1,26 @@
-export interface User {
-    id: string
-    nickname: string
-    avatar_url: string | null
-    status: 'online' | 'offline' | 'busy' | 'idle'
-    created_at: string
-    last_seen: string
-}
+﻿import type { Database as GeneratedDatabase } from './database.generated'
 
-export interface Channel {
-    id: string
-    name: string
-    type: 'text' | 'voice'
-    created_by: string | null
-    created_at: string
-}
+export type Database = GeneratedDatabase
 
-export interface Message {
-    id: string
-    channel_id: string
-    user_id: string
-    content: string
-    created_at: string
-    user?: User
-}
+type PublicTables = Database['public']['Tables']
 
-export interface VoiceParticipant {
-    id: string
-    channel_id: string
-    user_id: string
-    is_muted: boolean
-    is_deafened: boolean
-    is_screen_sharing: boolean
-    joined_at: string
-    user?: User
-}
+export type TableName = keyof PublicTables
+export type TableRow<T extends TableName> = PublicTables[T]['Row']
+export type TableInsert<T extends TableName> = PublicTables[T]['Insert']
+export type TableUpdate<T extends TableName> = PublicTables[T]['Update']
 
-export interface MusicQueueItem {
-    id: string
-    channel_id: string
-    user_id: string
-    youtube_url: string
-    title: string | null
-    thumbnail: string | null
-    duration: string | null
-    is_playing: boolean
-    position: number
-    created_at: string
-}
+export type UserRow = TableRow<'users'>
+export type User = Omit<UserRow, 'password_hash'>
 
-export interface Database {
-    public: {
-        Tables: {
-            users: {
-                Row: User
-                Insert: Omit<User, 'id' | 'created_at' | 'last_seen'> & { password_hash: string }
-                Update: Partial<User>
-            }
-            channels: {
-                Row: Channel
-                Insert: Omit<Channel, 'id' | 'created_at'>
-                Update: Partial<Channel>
-            }
-            messages: {
-                Row: Message
-                Insert: Omit<Message, 'id' | 'created_at'>
-                Update: Partial<Message>
-            }
-            voice_participants: {
-                Row: VoiceParticipant
-                Insert: Omit<VoiceParticipant, 'id' | 'joined_at'>
-                Update: Partial<VoiceParticipant>
-            }
-            music_queue: {
-                Row: MusicQueueItem
-                Insert: Omit<MusicQueueItem, 'id' | 'created_at'>
-                Update: Partial<MusicQueueItem>
-            }
-        }
-    }
-}
+export type Channel = TableRow<'channels'>
+export type ChannelType = Channel['type']
+
+export type MessageRow = TableRow<'messages'>
+export type Message = MessageRow & { user?: User }
+
+export type VoiceParticipantRow = TableRow<'voice_participants'>
+export type VoiceParticipant = VoiceParticipantRow & { user?: User }
+
+export type MusicQueueItem = TableRow<'music_queue'>
+export type UserStatus = UserRow['status']
+
