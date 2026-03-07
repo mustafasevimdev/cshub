@@ -187,6 +187,7 @@ async function createWindow() {
       sandbox: false,
       webSecurity: false,
       autoplayPolicy: 'no-user-gesture-required',
+      backgroundThrottling: false,
     },
     })
 

@@ -202,39 +202,21 @@ export function useVoice(channelId: string | null) {
     }, [])
 
     const requestVoiceStream = useCallback(async (settings: AudioSettings) => {
-        let timedOut = false
-
-        const streamPromise = navigator.mediaDevices.getUserMedia({
-            audio: {
-                deviceId: settings.inputDeviceId !== 'default'
-                    ? { exact: settings.inputDeviceId }
-                    : undefined,
-                echoCancellation: settings.echoCancellation,
-                noiseSuppression: settings.noiseSuppression,
-                autoGainControl: true,
-            },
-            video: false,
-        })
-
-        const safeStreamPromise = streamPromise
-            .then((stream) => {
-                if (timedOut) {
-                    stream.getTracks().forEach((track) => track.stop())
-                    return new MediaStream()
-                }
-
-                return stream
+        try {
+            return await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    deviceId: settings.inputDeviceId !== 'default'
+                        ? { exact: settings.inputDeviceId }
+                        : undefined,
+                    echoCancellation: settings.echoCancellation,
+                    noiseSuppression: settings.noiseSuppression,
+                    autoGainControl: true,
+                },
+                video: false,
             })
-            .catch(() => new MediaStream())
-
-        const timeoutPromise = new Promise<MediaStream>((resolve) => {
-            window.setTimeout(() => {
-                timedOut = true
-                resolve(new MediaStream())
-            }, 2500)
-        })
-
-        return Promise.race([safeStreamPromise, timeoutPromise])
+        } catch {
+            return new MediaStream()
+        }
     }, [])
 
     const withTimeout = useCallback(async <T,>(operation: PromiseLike<T>, timeoutMs: number, label: string) => {

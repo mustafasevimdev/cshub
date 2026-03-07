@@ -96,6 +96,7 @@ export function MainPage() {
   const playerHostRef = useRef<HTMLDivElement | null>(null)
   const playerRef = useRef<YT.Player | null>(null)
   const playerReadyRef = useRef(false)
+  const playerRecoveryTimeoutRef = useRef<number | null>(null)
   const progressTimerRef = useRef<number | null>(null)
   const playerSessionRef = useRef(0)
   const isSkippingRef = useRef(false)
@@ -265,6 +266,13 @@ export function MainPage() {
     }
   }, [])
 
+  const clearPlayerRecoveryTimeout = useCallback(() => {
+    if (playerRecoveryTimeoutRef.current !== null) {
+      window.clearTimeout(playerRecoveryTimeoutRef.current)
+      playerRecoveryTimeoutRef.current = null
+    }
+  }, [])
+
   const startProgressTimer = useCallback(() => {
     stopProgressTimer()
     updateProgressFromPlayer()
@@ -302,6 +310,7 @@ export function MainPage() {
   }
 
   const destroyPlayerSafely = useCallback(() => {
+    clearPlayerRecoveryTimeout()
     playerReadyRef.current = false
     if (!playerRef.current) return
 
@@ -312,7 +321,7 @@ export function MainPage() {
     } finally {
       playerRef.current = null
     }
-  }, [])
+  }, [clearPlayerRecoveryTimeout])
 
   const runPlayerCommand = useCallback((command: (player: YT.Player) => void) => {
     const player = playerRef.current
@@ -408,6 +417,7 @@ export function MainPage() {
     const source = currentSong?.youtube_url
     if (!voiceChannelId || !source || !playerHostRef.current || !isConnected) {
       stopProgressTimer()
+      clearPlayerRecoveryTimeout()
       setIsPlaybackPaused(false)
       playerSessionRef.current += 1
       destroyPlayerSafely()
@@ -418,6 +428,7 @@ export function MainPage() {
     playerSessionRef.current += 1
     const sessionId = playerSessionRef.current
     playerReadyRef.current = false
+    clearPlayerRecoveryTimeout()
     const muteParam = isDeafened ? 1 : 0
     const videoId = getYoutubeId(source)
     const searchQuery = isSearchSource(source) ? toSearchQuery(source) : null
@@ -434,8 +445,8 @@ export function MainPage() {
 
         try {
           playerRef.current = new yt.Player(playerHostRef.current, {
-            width: '1',
-            height: '1',
+            width: '320',
+            height: '180',
             videoId: videoId ?? undefined,
             playerVars: {
               autoplay: 1,
@@ -444,7 +455,7 @@ export function MainPage() {
               fs: 0,
               playsinline: 1,
               rel: 0,
-              origin: playerOrigin || 'http://127.0.0.1',
+              origin: playerOrigin,
               mute: muteParam,
               listType: searchQuery ? 'search' : undefined,
               list: searchQuery ?? undefined,
@@ -453,6 +464,7 @@ export function MainPage() {
               onReady: (event) => {
                 if (sessionId !== playerSessionRef.current) return
                 playerReadyRef.current = true
+                clearPlayerRecoveryTimeout()
                 if (muteParam === 1) event.target.mute()
                 else event.target.unMute()
                 setIsPlaybackPaused(false)
@@ -480,10 +492,19 @@ export function MainPage() {
               },
               onError: (event) => {
                 playerReadyRef.current = false
+                clearPlayerRecoveryTimeout()
                 console.error('YouTube player error:', event.data)
               },
             },
           })
+
+          clearPlayerRecoveryTimeout()
+          playerRecoveryTimeoutRef.current = window.setTimeout(() => {
+            if (sessionId !== playerSessionRef.current || playerReadyRef.current || !currentSong) return
+            console.error('YouTube player did not become ready in time, retrying mount once.')
+            destroyPlayerSafely()
+            setPlayerNonce((prev) => prev + 1)
+          }, 4000)
         } catch (error) {
           console.error('Failed to initialize YouTube player:', error)
           destroyPlayerSafely()
@@ -496,11 +517,12 @@ export function MainPage() {
     return () => {
       cancelled = true
       stopProgressTimer()
+      clearPlayerRecoveryTimeout()
       setIsPlaybackPaused(false)
       playerSessionRef.current += 1
       destroyPlayerSafely()
     }
-  }, [currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, isDeafened, playerNonce, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, isDeafened, playerNonce, clearPlayerRecoveryTimeout, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
 
   const renderMusicPlayer = () => {
     if (!currentSong || !voiceChannelId) return null
@@ -510,11 +532,14 @@ export function MainPage() {
         ref={playerHostRef} 
         style={{ 
           position: 'fixed', 
-          width: '200px', 
-          height: '200px', 
-          left: '-10000px', 
-          top: '-10000px', 
-          zIndex: -9999,
+          width: '320px', 
+          height: '180px', 
+          right: '12px', 
+          bottom: '12px', 
+          opacity: 0.015,
+          overflow: 'hidden',
+          borderRadius: '12px',
+          zIndex: 0,
           pointerEvents: 'none' 
         }} 
       />
