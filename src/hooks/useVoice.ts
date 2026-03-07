@@ -59,6 +59,10 @@ function toPublicUser(userRow: UserRow): User {
     return publicUser
 }
 
+function shouldInitiatePeerConnection(currentUserId: string, targetUserId: string) {
+    return currentUserId.localeCompare(targetUserId) < 0
+}
+
 export function useVoice(channelId: string | null) {
     const userId = useAuthStore((state) => state.user?.id)
     const [state, setState] = useState<VoiceState>({
@@ -363,6 +367,11 @@ export function useVoice(channelId: string | null) {
                 }
             })
 
+            const activeScreenTrack = screenShareStreamRef.current?.getVideoTracks()[0]
+            if (activeScreenTrack && screenShareStreamRef.current) {
+                peerConnection.addTrack(activeScreenTrack, screenShareStreamRef.current)
+            }
+
             peerConnection.onicecandidate = (event) => {
                 if (event.candidate) {
                     void sendSignal('ice-candidate', event.candidate.toJSON(), targetUserId)
@@ -552,7 +561,6 @@ export function useVoice(channelId: string | null) {
         void sendSignal('speaking', { isSpeaking: false })
     }, [sendSignal, userId])
 
-
     const initiateConnection = useCallback(
         async (targetUserId: string) => {
             const peerConnection = createPeerConnection(targetUserId)
@@ -562,6 +570,39 @@ export function useVoice(channelId: string | null) {
         },
         [createPeerConnection, sendSignal],
     )
+
+    const connectToParticipant = useCallback(
+        async (targetUserId: string) => {
+            if (!userId || targetUserId === userId) return
+            if (!shouldInitiatePeerConnection(userId, targetUserId)) return
+            if (peersRef.current.has(targetUserId)) return
+
+            await initiateConnection(targetUserId)
+        },
+        [initiateConnection, userId],
+    )
+
+    const connectToExistingParticipants = useCallback(async () => {
+        if (!channelId || !userId) return
+
+        const { data, error } = await supabase.from('voice_participants')
+            .select('user_id')
+            .eq('channel_id', channelId)
+
+        if (error || !data) {
+            if (error) {
+                console.error('Failed to fetch existing voice participants:', error)
+            }
+            return
+        }
+
+        const participantUserIds = [...new Set((data as Array<{ user_id: string }>).map((participant) => participant.user_id))]
+        await Promise.all(
+            participantUserIds
+                .filter((participantUserId) => participantUserId !== userId)
+                .map((participantUserId) => connectToParticipant(participantUserId)),
+        )
+    }, [channelId, connectToParticipant, userId])
 
     const joinVoice = useCallback(async () => {
         if (!userId || !channelId || isConnectedRef.current || isJoiningRef.current) return
@@ -658,9 +699,7 @@ export function useVoice(channelId: string | null) {
                 })
                 .on('presence', { event: 'join' }, ({ newPresences }: { newPresences: PresenceUser[] }) => {
                     newPresences.forEach((presence) => {
-                        if (presence.user_id !== userId) {
-                            void initiateConnection(presence.user_id)
-                        }
+                        void connectToParticipant(presence.user_id)
                     })
                 })
                 .on('presence', { event: 'leave' }, ({ leftPresences }: { leftPresences: PresenceUser[] }) => {
@@ -709,6 +748,7 @@ export function useVoice(channelId: string | null) {
             isConnectedRef.current = true
             setState((prev) => ({ ...prev, isConnected: true, localStream: joinedOutboundStream }))
             void fetchParticipants()
+            void connectToExistingParticipants()
 
             const participantsSyncChannel = supabase
                 .channel(`participants_sync_${channelId}`)
@@ -758,7 +798,8 @@ export function useVoice(channelId: string | null) {
         disposeRemoteAudioController,
         fetchParticipants,
         handleSignal,
-        initiateConnection,
+        connectToExistingParticipants,
+        connectToParticipant,
         requestVoiceStream,
         withTimeout,
     ])
