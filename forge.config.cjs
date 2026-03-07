@@ -1,15 +1,25 @@
 module.exports = {
   packagerConfig: {
     asar: true,
+    ignore: [
+      /^\/\.git/,
+      /^\/out($|\/)/,
+      /^\/CsHubInstaller($|\/)/,
+      /^\/src($|\/)/,
+      /^\/supabase($|\/)/,
+      /^\/scripts($|\/)/,
+      /^\/\.codex($|\/)/,
+      /^\/\.gemini($|\/)/,
+      /^\/\.vscode($|\/)/,
+      /\.md$/,
+      /\.exe$/,
+      /\.zip$/,
+      /\.csproj$/,
+      /\.user$/,
+    ],
   },
   rebuildConfig: {},
   makers: [
-    {
-      name: '@electron-forge/maker-squirrel',
-      config: {
-        name: 'CsHub',
-      },
-    },
     {
       name: '@electron-forge/maker-zip',
     },
@@ -21,3 +31,4 @@ module.exports = {
     },
   ],
 };
+
