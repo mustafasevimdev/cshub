@@ -29,6 +29,7 @@ interface PresenceUser {
 }
 
 type SinkableAudioElement = HTMLAudioElement & {
+    playsInline?: boolean
     setSinkId?: (deviceId: string) => Promise<void>
 }
 
@@ -186,6 +187,16 @@ export function useVoice(channelId: string | null) {
         },
         [setAudioSinkId],
     )
+
+    const ensureAudioContextRunning = useCallback(async (audioContext: AudioContext | null) => {
+        if (!audioContext || audioContext.state === 'running') return
+
+        try {
+            await audioContext.resume()
+        } catch (error) {
+            console.error('Failed to resume audio context:', error)
+        }
+    }, [])
 
     const applyInputAudioSettings = useCallback(async (settings: AudioSettings) => {
         if (microphoneGainRef.current) {
@@ -390,6 +401,7 @@ export function useVoice(channelId: string | null) {
                 if (!outputAudioContextRef.current) {
                     outputAudioContextRef.current = new AudioContext()
                 }
+                void ensureAudioContextRunning(outputAudioContextRef.current)
 
                 disposeRemoteAudioController(targetUserId)
 
@@ -405,6 +417,7 @@ export function useVoice(channelId: string | null) {
                 const audio = new Audio() as SinkableAudioElement
                 audio.srcObject = destinationNode.stream
                 audio.autoplay = true
+                audio.playsInline = true
                 audio.volume = 1
                 audio.muted = isDeafenedRef.current
 
@@ -440,7 +453,7 @@ export function useVoice(channelId: string | null) {
             peersRef.current.set(targetUserId, peerConnection)
             return peerConnection
         },
-        [disposeRemoteAudioController, sendSignal, setAudioSinkId, upsertRemoteTrack],
+        [disposeRemoteAudioController, ensureAudioContextRunning, sendSignal, setAudioSinkId, upsertRemoteTrack],
     )
 
     const handleSignal = useCallback(
@@ -617,6 +630,10 @@ export function useVoice(channelId: string | null) {
         let joinedAudioContext: AudioContext | null = null
         let joinedAnalyser: AnalyserNode | null = null
         let joinedMicrophoneGain: GainNode | null = null
+        let resolveSignalSubscribed: (() => void) | null = null
+        const signalSubscribedPromise = new Promise<void>((resolve) => {
+            resolveSignalSubscribed = resolve
+        })
 
         const isStaleAttempt = () => joinAttemptRef.current !== attemptId
         const disposeJoinAttemptResources = async () => {
@@ -651,6 +668,7 @@ export function useVoice(channelId: string | null) {
                 try {
                     const inputAudioContext = new AudioContext()
                     joinedAudioContext = inputAudioContext
+                    await ensureAudioContextRunning(inputAudioContext)
                     const source = inputAudioContext.createMediaStreamSource(stream)
                     const microphoneGain = inputAudioContext.createGain()
                     microphoneGain.gain.value = currentAudioSettings.inputVolume / 100
@@ -720,8 +738,16 @@ export function useVoice(channelId: string | null) {
                 .subscribe(async (status) => {
                     if (status === 'SUBSCRIBED') {
                         await signalChannel.track({ user_id: userId, online_at: new Date().toISOString() })
+                        resolveSignalSubscribed?.()
                     }
                 })
+
+            if (isStaleAttempt()) {
+                await disposeJoinAttemptResources()
+                return
+            }
+
+            await withTimeout(signalSubscribedPromise, 3000, 'voice signal subscribe')
 
             if (isStaleAttempt()) {
                 await disposeJoinAttemptResources()
@@ -801,6 +827,7 @@ export function useVoice(channelId: string | null) {
         connectToExistingParticipants,
         connectToParticipant,
         requestVoiceStream,
+        ensureAudioContextRunning,
         withTimeout,
     ])
 
