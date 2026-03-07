@@ -444,7 +444,7 @@ export function MainPage() {
               fs: 0,
               playsinline: 1,
               rel: 0,
-              origin: playerOrigin,
+              origin: playerOrigin || 'http://127.0.0.1',
               mute: muteParam,
               listType: searchQuery ? 'search' : undefined,
               list: searchQuery ?? undefined,
@@ -505,7 +505,21 @@ export function MainPage() {
   const renderMusicPlayer = () => {
     if (!currentSong || !voiceChannelId) return null
 
-    return <div ref={playerHostRef} style={{ position: 'absolute', width: '1px', height: '1px', overflow: 'hidden', opacity: 0.01, pointerEvents: 'none' }} />
+    return (
+      <div 
+        ref={playerHostRef} 
+        style={{ 
+          position: 'fixed', 
+          width: '200px', 
+          height: '200px', 
+          left: '-10000px', 
+          top: '-10000px', 
+          zIndex: -9999,
+          pointerEvents: 'none' 
+        }} 
+      />
+    )
+
   }
 
 

@@ -181,13 +181,13 @@ async function createWindow() {
         autoHideMenuBar: true,
         show: false,
         webPreferences: {
-            preload: path.join(__dirname, 'preload.cjs'),
-            nodeIntegration: false,
-            contextIsolation: true,
-            sandbox: true,
-            webSecurity: true,
-            autoplayPolicy: 'no-user-gesture-required',
-        },
+      preload: path.join(__dirname, 'preload.cjs'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
+      webSecurity: false,
+      autoplayPolicy: 'no-user-gesture-required',
+    },
     })
 
     mainWindow.once('ready-to-show', () => {
