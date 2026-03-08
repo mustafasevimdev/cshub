@@ -187,7 +187,6 @@ function buildMusicPlayerHtml() {
                   event.target.seekTo(startAt, true)
                 }
                 event.target.mute()
-                mutedState = true
                 event.target.playVideo()
                 emitState()
               },
@@ -282,12 +281,20 @@ async function ensureMusicWindow() {
     }
 
     musicWindow = new BrowserWindow({
-        show: false,
-        width: 320,
-        height: 180,
+        show: true,
+        width: 1,
+        height: 1,
+        x: -10000,
+        y: -10000,
         frame: false,
         transparent: true,
         backgroundColor: '#000000',
+        resizable: false,
+        minimizable: false,
+        maximizable: false,
+        closable: false,
+        focusable: false,
+        skipTaskbar: true,
         webPreferences: {
             autoplayPolicy: 'no-user-gesture-required',
             backgroundThrottling: false,
@@ -295,6 +302,8 @@ async function ensureMusicWindow() {
             sandbox: false,
         },
     })
+    musicWindow.setIgnoreMouseEvents(true)
+    musicWindow.setVisibleOnAllWorkspaces(false)
     musicWindow.webContents.setAudioMuted(false)
     musicWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     musicWindow.on('closed', () => {

@@ -441,6 +441,15 @@ export function MainPage() {
     }
   }, [electronMusicState?.currentTime, isElectronRuntime])
 
+  const getSyncedPlaybackPosition = useCallback(async () => {
+    if (isElectronRuntime && window.electronAPI) {
+      const snapshot = await window.electronAPI.getMusicState()
+      return snapshot?.currentTime ?? 0
+    }
+
+    return getPlayerCurrentTime()
+  }, [getPlayerCurrentTime, isElectronRuntime])
+
 
   useEffect(() => {
     const didRun = runPlayerCommand((player) => {
@@ -599,13 +608,14 @@ export function MainPage() {
     }
   }, [destroyPlayerSafely, nextSong, stopProgressTimer])
 
-  const handleStopCurrentSong = useCallback(() => {
+  const handleStopCurrentSong = useCallback(async () => {
     if (isMusicControlBusyRef.current) return
 
     isMusicControlBusyRef.current = true
 
     try {
       if (!currentSong) return
+      const syncedPosition = await getSyncedPlaybackPosition()
 
       if (isPlaybackPaused) {
         const resumed = applyResumePlayback()
@@ -614,27 +624,27 @@ export function MainPage() {
             action: 'resume',
             songId: currentSong.id,
             issuedBy: user?.id,
-            positionSeconds: getPlayerCurrentTime(),
+            positionSeconds: syncedPosition,
             sentAtMs: Date.now(),
           })
         }
         return
       }
 
-      const paused = applyPausePlayback()
+      const paused = applyPausePlayback(syncedPosition)
       if (paused) {
         void broadcastMusicSync({
           action: 'pause',
           songId: currentSong.id,
           issuedBy: user?.id,
-          positionSeconds: getPlayerCurrentTime(),
+          positionSeconds: syncedPosition,
           sentAtMs: Date.now(),
         })
       }
     } finally {
       isMusicControlBusyRef.current = false
     }
-  }, [applyPausePlayback, applyResumePlayback, broadcastMusicSync, currentSong, getPlayerCurrentTime, isPlaybackPaused, user?.id])
+  }, [applyPausePlayback, applyResumePlayback, broadcastMusicSync, currentSong, getSyncedPlaybackPosition, isPlaybackPaused, user?.id])
 
   useEffect(() => {
     if (!isElectronRuntime || !window.electronAPI) return
