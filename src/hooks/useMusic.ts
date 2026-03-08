@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef } from 'react'
 import { supabase } from '@/lib/supabase'
-import { isLegacySearchSource, resolveYouTubeSource, toLegacySearchQuery } from '@/lib/youtube'
+import { isLegacySearchSource, normalizeYouTubeInput, resolveYouTubeSource, toLegacySearchQuery } from '@/lib/youtube'
 import { useAuthStore } from '@/stores'
 import type { MusicQueueItem } from '@/types'
 
@@ -129,20 +129,29 @@ export function useMusic(channelId: string | null) {
             }
 
             const position = queue.length > 0 ? queue[queue.length - 1].position + 1 : 0
-            const resolvedSource = await resolveYouTubeSource(input)
-            if (!resolvedSource) {
+            const normalizedInput = input.trim()
+            const normalizedUrl = normalizeYouTubeInput(normalizedInput)
+            const resolvedSource = await resolveYouTubeSource(normalizedInput)
+            const resolvedTitle = resolvedSource?.title
+
+            let source = resolvedSource?.source ?? null
+            if (!source && !normalizedUrl && normalizedInput) {
+                source = `ytsearch:${encodeURIComponent(normalizedInput)}`
+            }
+
+            if (!source) {
                 return { success: false, error: 'Sarki bulunamadi. YouTube linki veya sarki adini tekrar deneyin.' }
             }
 
-            const fallbackTitle = input.trim() || 'Bilinmeyen Sarki'
-            const songTitle = title || resolvedSource.title || fallbackTitle
+            const fallbackTitle = normalizedInput || 'Bilinmeyen Sarki'
+            const songTitle = title || resolvedTitle || fallbackTitle
 
             const shouldPlay = !isPlaying && !currentSong
 
             const { data, error } = await supabase.from('music_queue').insert({
                 channel_id: channelId,
                 user_id: user.id,
-                youtube_url: resolvedSource.source,
+                youtube_url: source,
                 title: songTitle,
                 position,
                 is_playing: shouldPlay,
@@ -164,8 +173,8 @@ export function useMusic(channelId: string | null) {
                     currentSongRef.current = insertedItem
                 }
 
-                if (!title && !resolvedSource.title) {
-                    void enrichSongTitle(insertedItem.id, resolvedSource.source)
+                if (!title && !resolvedTitle && !source.startsWith('ytsearch:')) {
+                    void enrichSongTitle(insertedItem.id, source)
                 }
             }
 

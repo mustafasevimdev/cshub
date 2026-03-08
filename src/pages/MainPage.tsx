@@ -73,6 +73,9 @@ type MusicSyncAction = 'pause' | 'resume' | 'restart'
 interface MusicSyncPayload {
   action: MusicSyncAction
   songId: string
+  issuedBy?: string
+  positionSeconds?: number
+  sentAtMs?: number
 }
 
 export function MainPage() {
@@ -110,6 +113,10 @@ export function MainPage() {
   const isSkippingRef = useRef(false)
   const isMusicControlBusyRef = useRef(false)
   const musicSyncChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+  const startSyncSentForSongRef = useRef<string | null>(null)
+  const pendingMusicSyncRef = useRef<MusicSyncPayload | null>(null)
+  const isSongOwner = Boolean(currentSong && user?.id === currentSong.user_id)
+  const currentSongId = currentSong?.id ?? null
 
   const isSearchSource = (value: string) => value.startsWith('ytsearch:')
   const toSearchQuery = (value: string) => decodeURIComponent(value.slice('ytsearch:'.length))
@@ -242,6 +249,16 @@ export function MainPage() {
     setSelectedCommandIndex(0)
   }
 
+  useEffect(() => {
+    startSyncSentForSongRef.current = null
+    if (!currentSongId && pendingMusicSyncRef.current) {
+      pendingMusicSyncRef.current = null
+      return
+    }
+    if (currentSongId && pendingMusicSyncRef.current && pendingMusicSyncRef.current.songId !== currentSongId) {
+      pendingMusicSyncRef.current = null
+    }
+  }, [currentSongId])
 
   const formatDuration = useCallback((seconds: number) => {
     if (!Number.isFinite(seconds) || seconds <= 0) return '0:00'
@@ -345,6 +362,18 @@ export function MainPage() {
     }
   }, [])
 
+  const getPlayerCurrentTime = useCallback(() => {
+    const player = playerRef.current
+    if (!player || !playerReadyRef.current) return 0
+
+    try {
+      const currentTime = player.getCurrentTime()
+      return Number.isFinite(currentTime) ? currentTime : 0
+    } catch {
+      return 0
+    }
+  }, [])
+
   const broadcastMusicSync = useCallback(async (payload: MusicSyncPayload) => {
     if (!voiceChannelId || !musicSyncChannelRef.current) return
 
@@ -359,9 +388,9 @@ export function MainPage() {
     }
   }, [voiceChannelId])
 
-  const applyRestartPlayback = useCallback(() => {
+  const applyRestartPlayback = useCallback((startAtSeconds = 0) => {
     const didRun = runPlayerCommand((player) => {
-      player.seekTo(0, true)
+      player.seekTo(startAtSeconds, true)
       player.playVideo()
     })
 
@@ -379,8 +408,11 @@ export function MainPage() {
     return true
   }, [currentSong, runPlayerCommand, startProgressTimer, updateProgressFromPlayer])
 
-  const applyResumePlayback = useCallback(() => {
+  const applyResumePlayback = useCallback((startAtSeconds?: number) => {
     const didRun = runPlayerCommand((player) => {
+      if (typeof startAtSeconds === 'number' && Number.isFinite(startAtSeconds) && startAtSeconds >= 0) {
+        player.seekTo(startAtSeconds, true)
+      }
       player.playVideo()
     })
     if (!didRun) {
@@ -395,8 +427,11 @@ export function MainPage() {
     return true
   }, [currentSong, runPlayerCommand, startProgressTimer])
 
-  const applyPausePlayback = useCallback(() => {
+  const applyPausePlayback = useCallback((seekToSeconds?: number) => {
     const didRun = runPlayerCommand((player) => {
+      if (typeof seekToSeconds === 'number' && Number.isFinite(seekToSeconds) && seekToSeconds >= 0) {
+        player.seekTo(seekToSeconds, true)
+      }
       player.pauseVideo()
     })
     if (!didRun) return false
@@ -413,9 +448,15 @@ export function MainPage() {
     if (!currentSong) return
     const restarted = applyRestartPlayback()
     if (restarted) {
-      void broadcastMusicSync({ action: 'restart', songId: currentSong.id })
+      void broadcastMusicSync({
+        action: 'restart',
+        songId: currentSong.id,
+        issuedBy: user?.id,
+        positionSeconds: 0,
+        sentAtMs: Date.now(),
+      })
     }
-  }, [applyRestartPlayback, broadcastMusicSync, currentSong])
+  }, [applyRestartPlayback, broadcastMusicSync, currentSong, user?.id])
 
   const handleNextSong = useCallback(async () => {
     if (isSkippingRef.current || isMusicControlBusyRef.current) return
@@ -449,22 +490,57 @@ export function MainPage() {
       if (isPlaybackPaused) {
         const resumed = applyResumePlayback()
         if (resumed) {
-          void broadcastMusicSync({ action: 'resume', songId: currentSong.id })
+          void broadcastMusicSync({
+            action: 'resume',
+            songId: currentSong.id,
+            issuedBy: user?.id,
+            positionSeconds: getPlayerCurrentTime(),
+            sentAtMs: Date.now(),
+          })
         }
         return
       }
 
       const paused = applyPausePlayback()
       if (paused) {
-        void broadcastMusicSync({ action: 'pause', songId: currentSong.id })
+        void broadcastMusicSync({
+          action: 'pause',
+          songId: currentSong.id,
+          issuedBy: user?.id,
+          positionSeconds: getPlayerCurrentTime(),
+          sentAtMs: Date.now(),
+        })
       }
     } finally {
       isMusicControlBusyRef.current = false
     }
-  }, [applyPausePlayback, applyResumePlayback, broadcastMusicSync, currentSong, isPlaybackPaused])
+  }, [applyPausePlayback, applyResumePlayback, broadcastMusicSync, currentSong, getPlayerCurrentTime, isPlaybackPaused, user?.id])
+
+  useEffect(() => {
+    const pending = pendingMusicSyncRef.current
+    if (!pending || !currentSong || pending.songId !== currentSong.id) return
+
+    const networkDelaySeconds = pending.sentAtMs ? Math.max(0, (Date.now() - pending.sentAtMs) / 1000) : 0
+    let applied = false
+
+    if (pending.action === 'pause') {
+      applied = applyPausePlayback(pending.positionSeconds)
+    } else if (pending.action === 'resume') {
+      const resumePosition = (pending.positionSeconds ?? 0) + networkDelaySeconds
+      applied = applyResumePlayback(resumePosition)
+    } else if (pending.action === 'restart') {
+      const restartPosition = (pending.positionSeconds ?? 0) + networkDelaySeconds
+      applied = applyRestartPlayback(restartPosition)
+    }
+
+    if (applied) {
+      pendingMusicSyncRef.current = null
+    }
+  }, [currentSong, applyPausePlayback, applyResumePlayback, applyRestartPlayback])
 
   useEffect(() => {
     if (!voiceChannelId) {
+      pendingMusicSyncRef.current = null
       if (musicSyncChannelRef.current) {
         void musicSyncChannelRef.current.unsubscribe()
         musicSyncChannelRef.current = null
@@ -475,20 +551,28 @@ export function MainPage() {
     const syncChannel = supabase
       .channel(`music_sync:${voiceChannelId}`)
       .on('broadcast', { event: 'music-control' }, ({ payload }: { payload: MusicSyncPayload }) => {
-        if (!currentSong || payload.songId !== currentSong.id) return
+        if (payload.issuedBy && payload.issuedBy === user?.id) return
+        if (!currentSong || payload.songId !== currentSong.id) {
+          pendingMusicSyncRef.current = payload
+          return
+        }
+        const networkDelaySeconds = payload.sentAtMs ? Math.max(0, (Date.now() - payload.sentAtMs) / 1000) : 0
+        let applied = false
 
         if (payload.action === 'pause') {
-          applyPausePlayback()
-          return
+          applied = applyPausePlayback(payload.positionSeconds)
+        } else if (payload.action === 'resume') {
+          const resumePosition = (payload.positionSeconds ?? 0) + networkDelaySeconds
+          applied = applyResumePlayback(resumePosition)
+        } else if (payload.action === 'restart') {
+          const restartPosition = (payload.positionSeconds ?? 0) + networkDelaySeconds
+          applied = applyRestartPlayback(restartPosition)
         }
 
-        if (payload.action === 'resume') {
-          applyResumePlayback()
-          return
-        }
-
-        if (payload.action === 'restart') {
-          applyRestartPlayback()
+        if (!applied) {
+          pendingMusicSyncRef.current = payload
+        } else if (pendingMusicSyncRef.current?.songId === payload.songId) {
+          pendingMusicSyncRef.current = null
         }
       })
       .subscribe()
@@ -501,7 +585,7 @@ export function MainPage() {
       }
       void syncChannel.unsubscribe()
     }
-  }, [voiceChannelId, currentSong, applyPausePlayback, applyResumePlayback, applyRestartPlayback])
+  }, [voiceChannelId, currentSong, applyPausePlayback, applyResumePlayback, applyRestartPlayback, user?.id])
 
   useEffect(() => {
     const source = currentSong?.youtube_url
@@ -560,6 +644,39 @@ export function MainPage() {
                 setIsPlaybackPaused(false)
                 event.target.playVideo()
                 updateProgressFromPlayer()
+
+                const pending = pendingMusicSyncRef.current
+                if (pending && currentSong && pending.songId === currentSong.id) {
+                  const networkDelaySeconds = pending.sentAtMs ? Math.max(0, (Date.now() - pending.sentAtMs) / 1000) : 0
+                  let applied = false
+                  if (pending.action === 'pause') {
+                    applied = applyPausePlayback(pending.positionSeconds)
+                  } else if (pending.action === 'resume') {
+                    const resumePosition = (pending.positionSeconds ?? 0) + networkDelaySeconds
+                    applied = applyResumePlayback(resumePosition)
+                  } else if (pending.action === 'restart') {
+                    const restartPosition = (pending.positionSeconds ?? 0) + networkDelaySeconds
+                    applied = applyRestartPlayback(restartPosition)
+                  }
+                  if (applied) {
+                    pendingMusicSyncRef.current = null
+                  }
+                }
+
+                if (
+                  isSongOwner &&
+                  currentSong &&
+                  startSyncSentForSongRef.current !== currentSong.id
+                ) {
+                  startSyncSentForSongRef.current = currentSong.id
+                  void broadcastMusicSync({
+                    action: 'resume',
+                    songId: currentSong.id,
+                    issuedBy: user?.id,
+                    positionSeconds: 0,
+                    sentAtMs: Date.now(),
+                  })
+                }
               },
               onStateChange: (event) => {
                 if (sessionId !== playerSessionRef.current) return
@@ -577,7 +694,9 @@ export function MainPage() {
                   setIsPlaybackPaused(false)
                   stopProgressTimer()
                   setSongProgress(100)
-                  void handleNextSong()
+                  if (isSongOwner) {
+                    void handleNextSong()
+                  }
                 }
               },
               onError: (event) => {
@@ -612,7 +731,7 @@ export function MainPage() {
       playerSessionRef.current += 1
       destroyPlayerSafely()
     }
-  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, isDeafened, playerNonce, clearPlayerRecoveryTimeout, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, isDeafened, playerNonce, isSongOwner, user?.id, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearPlayerRecoveryTimeout, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
 
   const renderMusicPlayer = () => {
     if (!currentSong || !voiceChannelId) return null

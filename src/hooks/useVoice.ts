@@ -7,7 +7,20 @@ import { AUDIO_SETTINGS_CHANGE_EVENT, getSavedAudioSettings } from './useAudioSe
 import type { AudioSettings } from './useAudioSettings'
 
 const RTC_CONFIG: RTCConfiguration = {
-    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:global.stun.twilio.com:3478' }],
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:global.stun.twilio.com:3478' },
+        { urls: 'stun:openrelay.metered.ca:80' },
+        {
+            urls: [
+                'turn:openrelay.metered.ca:80',
+                'turn:openrelay.metered.ca:443',
+                'turn:openrelay.metered.ca:443?transport=tcp',
+            ],
+            username: 'openrelayproject',
+            credential: 'openrelayproject',
+        },
+    ],
 }
 
 type SignalType = 'offer' | 'answer' | 'ice-candidate' | 'speaking' | 'renegotiate'
@@ -35,9 +48,6 @@ type SinkableAudioElement = HTMLAudioElement & {
 
 interface RemoteAudioController {
     audio: SinkableAudioElement
-    sourceNode: MediaStreamAudioSourceNode
-    gainNode: GainNode
-    destinationNode: MediaStreamAudioDestinationNode
 }
 
 
@@ -89,7 +99,6 @@ export function useVoice(channelId: string | null) {
     const remoteAudioControllersRef = useRef<Map<string, RemoteAudioController>>(new Map())
 
     const audioContextRef = useRef<AudioContext | null>(null)
-    const outputAudioContextRef = useRef<AudioContext | null>(null)
     const analyserRef = useRef<AnalyserNode | null>(null)
     const microphoneGainRef = useRef<GainNode | null>(null)
     const animationFrameRef = useRef<number | null>(null)
@@ -127,9 +136,6 @@ export function useVoice(channelId: string | null) {
 
         controller.audio.pause()
         controller.audio.srcObject = null
-        controller.sourceNode.disconnect()
-        controller.gainNode.disconnect()
-        controller.destinationNode.disconnect()
         remoteAudioControllersRef.current.delete(targetUserId)
         remoteAudioRefs.current.delete(targetUserId)
     }, [])
@@ -176,8 +182,8 @@ export function useVoice(channelId: string | null) {
     const applyOutputAudioSettings = useCallback(
         async (settings: AudioSettings) => {
             remoteAudioControllersRef.current.forEach((controller) => {
-                controller.gainNode.gain.value = settings.outputVolume / 100
                 controller.audio.muted = isDeafenedRef.current
+                controller.audio.volume = Math.min(1, Math.max(0, settings.outputVolume / 100))
             })
 
             await Promise.all(
@@ -191,6 +197,7 @@ export function useVoice(channelId: string | null) {
 
     const ensureAudioContextRunning = useCallback(async (audioContext: AudioContext | null) => {
         if (!audioContext || audioContext.state === 'running') return
+        if (typeof audioContext.resume !== 'function') return
 
         try {
             await audioContext.resume()
@@ -291,11 +298,6 @@ export function useVoice(channelId: string | null) {
         audioContextRef.current = null
         if (inputAudioContext) {
             await inputAudioContext.close()
-        }
-        const outputAudioContext = outputAudioContextRef.current
-        outputAudioContextRef.current = null
-        if (outputAudioContext) {
-            await outputAudioContext.close()
         }
         analyserRef.current = null
         microphoneGainRef.current = null
@@ -400,27 +402,13 @@ export function useVoice(channelId: string | null) {
 
                 if (stream.getAudioTracks().length === 0) return
 
-                if (!outputAudioContextRef.current) {
-                    outputAudioContextRef.current = new AudioContext()
-                }
-                void ensureAudioContextRunning(outputAudioContextRef.current)
-
                 disposeRemoteAudioController(targetUserId)
 
-                const outputContext = outputAudioContextRef.current
-                const sourceNode = outputContext.createMediaStreamSource(stream)
-                const gainNode = outputContext.createGain()
-                gainNode.gain.value = audioSettingsRef.current.outputVolume / 100
-
-                const destinationNode = outputContext.createMediaStreamDestination()
-                sourceNode.connect(gainNode)
-                gainNode.connect(destinationNode)
-
                 const audio = new Audio() as SinkableAudioElement
-                audio.srcObject = destinationNode.stream
+                audio.srcObject = stream
                 audio.autoplay = true
                 audio.playsInline = true
-                audio.volume = 1
+                audio.volume = Math.min(1, Math.max(0, audioSettingsRef.current.outputVolume / 100))
                 audio.muted = isDeafenedRef.current
 
                 stream.getAudioTracks().forEach((track) => {
@@ -430,17 +418,44 @@ export function useVoice(channelId: string | null) {
                 remoteAudioRefs.current.set(targetUserId, audio)
                 remoteAudioControllersRef.current.set(targetUserId, {
                     audio,
-                    sourceNode,
-                    gainNode,
-                    destinationNode,
                 })
 
                 void setAudioSinkId(audio, audioSettingsRef.current.outputDeviceId)
-                void audio.play().catch(console.error)
+                void audio.play().catch((error) => {
+                    console.error('Remote audio autoplay failed:', error)
+                    const retryPlayback = () => {
+                        void audio.play().catch(() => undefined)
+                    }
+                    window.addEventListener('pointerdown', retryPlayback, { once: true })
+                    window.addEventListener('keydown', retryPlayback, { once: true })
+                })
+            }
+
+            peerConnection.oniceconnectionstatechange = async () => {
+                if (
+                    peerConnection.iceConnectionState !== 'failed' ||
+                    !userId ||
+                    !shouldInitiatePeerConnection(userId, targetUserId) ||
+                    !isConnectedRef.current
+                ) {
+                    return
+                }
+
+                try {
+                    const restartOffer = await peerConnection.createOffer({ iceRestart: true })
+                    await peerConnection.setLocalDescription(restartOffer)
+                    await sendSignal('offer', restartOffer, targetUserId)
+                } catch (error) {
+                    console.error('ICE restart offer failed:', error)
+                }
             }
 
             peerConnection.onnegotiationneeded = async () => {
-                if (peerConnection.signalingState !== 'stable' || !isConnectedRef.current) return
+                if (
+                    peerConnection.signalingState !== 'stable' ||
+                    !isConnectedRef.current ||
+                    !peerConnection.remoteDescription
+                ) return
 
                 try {
                     const offer = await peerConnection.createOffer()
@@ -455,7 +470,7 @@ export function useVoice(channelId: string | null) {
             peersRef.current.set(targetUserId, peerConnection)
             return peerConnection
         },
-        [disposeRemoteAudioController, ensureAudioContextRunning, sendSignal, setAudioSinkId, upsertRemoteTrack],
+        [disposeRemoteAudioController, sendSignal, setAudioSinkId, upsertRemoteTrack, userId],
     )
 
     const flushPendingIceCandidates = useCallback(async (targetUserId: string, peerConnection: RTCPeerConnection) => {
@@ -483,7 +498,14 @@ export function useVoice(channelId: string | null) {
             if (!peerConnection && type === 'offer') {
                 peerConnection = createPeerConnection(fromUserId)
             }
-            if (!peerConnection) return
+            if (!peerConnection) {
+                if (type === 'ice-candidate' && data) {
+                    const queuedCandidates = pendingIceCandidatesRef.current.get(fromUserId) ?? []
+                    queuedCandidates.push(data as RTCIceCandidateInit)
+                    pendingIceCandidatesRef.current.set(fromUserId, queuedCandidates)
+                }
+                return
+            }
 
             try {
                 if (type === 'offer' && data) {
