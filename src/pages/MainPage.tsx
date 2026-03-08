@@ -3,6 +3,7 @@ import { useChannels, useMessages, useAuth, useVoice, useMusic } from '@/hooks'
 import { useAppStore, useAuthStore } from '@/stores'
 import { SettingsModal, TitleBar } from '@/components'
 import { supabase } from '@/lib/supabase'
+import { resolveYouTubeSource } from '@/lib/youtube'
 import type { Channel } from '@/types'
 
 const UI = {
@@ -604,15 +605,42 @@ export function MainPage() {
     playerReadyRef.current = false
     clearPlayerRecoveryTimeout()
     const muteParam = isDeafened ? 1 : 0
-    const videoId = getYoutubeId(source)
-    const searchQuery = isSearchSource(source) ? toSearchQuery(source) : null
     const playerOrigin = window.location.origin.startsWith('http')
       ? window.location.origin
       : undefined
 
     void ensureYouTubeApi()
-      .then((yt) => {
+      .then(async (yt) => {
         if (cancelled || !playerHostRef.current || !yt?.Player || sessionId !== playerSessionRef.current) return
+
+        let playbackSource = source
+        let searchQuery: string | null = null
+
+        if (isSearchSource(source)) {
+          searchQuery = toSearchQuery(source)
+
+          const resolved = await resolveYouTubeSource(searchQuery)
+          if (cancelled || !playerHostRef.current || sessionId !== playerSessionRef.current) return
+
+          if (resolved?.source) {
+            playbackSource = resolved.source
+            searchQuery = null
+
+            if (isSongOwner && currentSong && resolved.source !== source) {
+              void supabase
+                .from('music_queue')
+                .update({ youtube_url: resolved.source, title: resolved.title ?? currentSong.title } as never)
+                .eq('id', currentSong.id)
+                .then(({ error }) => {
+                  if (error) {
+                    console.error('Failed to persist resolved playback source:', error)
+                  }
+                })
+            }
+          }
+        }
+
+        const videoId = getYoutubeId(playbackSource)
 
         destroyPlayerSafely()
         playerHostRef.current.innerHTML = ''

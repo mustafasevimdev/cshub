@@ -10,8 +10,19 @@ let rendererServer = null
 let rendererServerUrl = null
 
 const YOUTUBE_SEARCH_BASE = 'https://www.youtube.com/results?hl=tr&persist_hl=1&search_query='
+const YOUTUBE_SEARCH_FALLBACK_BASE = 'https://r.jina.ai/http://www.youtube.com/results?hl=tr&persist_hl=1&search_query='
 const SEARCH_TIMEOUT_MS = 3000
+const SEARCH_CACHE_TTL_MS = 30 * 60 * 1000
+const ALLOWED_PERMISSIONS = new Set([
+    'audioCapture',
+    'clipboard-sanitized-write',
+    'display-capture',
+    'fullscreen',
+    'media',
+    'videoCapture',
+])
 const searchCache = new Map()
+const pendingSearches = new Map()
 const DIST_DIR = path.join(__dirname, '../dist')
 const MIME_TYPES = {
     '.css': 'text/css; charset=utf-8',
@@ -32,6 +43,7 @@ function extractFirstYouTubeVideoId(value) {
     const patterns = [
         /https?:\/\/www\.youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})/i,
         /watch\?v=([A-Za-z0-9_-]{11})/i,
+        /"videoRenderer":\{"videoId":"([A-Za-z0-9_-]{11})"/i,
         /"videoId":"([A-Za-z0-9_-]{11})"/i,
     ]
 
@@ -45,18 +57,61 @@ function extractFirstYouTubeVideoId(value) {
     return null
 }
 
+function sanitizeSearchTitle(value) {
+    if (typeof value !== 'string' || !value) return undefined
+
+    return value
+        .replace(/\\u0026/g, '&')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, '\'')
+        .replace(/&amp;/g, '&')
+        .trim()
+}
+
 function extractFirstYouTubeTitle(value) {
     const headingMatch = value.match(/### \[(.+?)\]\(http:\/\/www\.youtube\.com\/watch\?v=/i)
     if (headingMatch && headingMatch[1]) {
-        return headingMatch[1]
+        return sanitizeSearchTitle(headingMatch[1])
     }
 
     const titleMatch = value.match(/"title":\{"runs":\[\{"text":"(.+?)"/i)
     if (titleMatch && titleMatch[1]) {
-        return titleMatch[1]
+        return sanitizeSearchTitle(titleMatch[1])
     }
 
     return undefined
+}
+
+async function requestSearchPayload(baseUrl, query) {
+    const normalizedQuery = query.trim()
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS)
+
+    try {
+        const response = await fetch(`${baseUrl}${encodeURIComponent(normalizedQuery)}`, {
+            headers: {
+                'accept-language': 'tr-TR,tr;q=0.9,en;q=0.8',
+                'user-agent': 'Mozilla/5.0',
+            },
+            signal: controller.signal,
+        })
+
+        if (!response.ok) return null
+        return await response.text()
+    } finally {
+        clearTimeout(timeout)
+    }
+}
+
+function parseSearchPayload(payload) {
+    const videoId = extractFirstYouTubeVideoId(payload)
+    if (!videoId) return null
+
+    return {
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        title: extractFirstYouTubeTitle(payload),
+    }
 }
 
 async function resolveYouTubeSearch(query) {
@@ -66,43 +121,47 @@ async function resolveYouTubeSearch(query) {
 
     const normalizedQuery = query.trim()
     const cacheKey = normalizedQuery.toLocaleLowerCase('tr-TR')
-    if (searchCache.has(cacheKey)) {
-        return searchCache.get(cacheKey)
+    const now = Date.now()
+    const cached = searchCache.get(cacheKey)
+    if (cached && cached.expiresAt > now) {
+        return cached.value
     }
 
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), SEARCH_TIMEOUT_MS)
-    let response
-
-    try {
-        response = await fetch(`${YOUTUBE_SEARCH_BASE}${encodeURIComponent(normalizedQuery)}`, {
-            headers: {
-                'accept-language': 'tr-TR,tr;q=0.9,en;q=0.8',
-                'user-agent': 'Mozilla/5.0',
-            },
-            signal: controller.signal,
-        })
-    } finally {
-        clearTimeout(timeout)
+    const pending = pendingSearches.get(cacheKey)
+    if (pending) {
+        return pending
     }
 
-    if (!response.ok) {
-        throw new Error(`Music search failed with status ${response.status}`)
-    }
+    const searchPromise = (async () => {
+        const primaryPayload = await requestSearchPayload(YOUTUBE_SEARCH_BASE, normalizedQuery)
+        const primaryResult = primaryPayload ? parseSearchPayload(primaryPayload) : null
+        if (primaryResult) {
+            searchCache.set(cacheKey, {
+                value: primaryResult,
+                expiresAt: now + SEARCH_CACHE_TTL_MS,
+            })
+            return primaryResult
+        }
 
-    const payload = await response.text()
-    const videoId = extractFirstYouTubeVideoId(payload)
-    if (!videoId) {
+        const fallbackPayload = await requestSearchPayload(YOUTUBE_SEARCH_FALLBACK_BASE, normalizedQuery)
+        const fallbackResult = fallbackPayload ? parseSearchPayload(fallbackPayload) : null
+        if (fallbackResult) {
+            searchCache.set(cacheKey, {
+                value: fallbackResult,
+                expiresAt: now + SEARCH_CACHE_TTL_MS,
+            })
+            return fallbackResult
+        }
+
         return null
-    }
+    })()
 
-    const resolved = {
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        title: extractFirstYouTubeTitle(payload),
+    pendingSearches.set(cacheKey, searchPromise)
+    try {
+        return await searchPromise
+    } finally {
+        pendingSearches.delete(cacheKey)
     }
-
-    searchCache.set(cacheKey, resolved)
-    return resolved
 }
 
 function getContentType(filePath) {
@@ -190,6 +249,9 @@ async function createWindow() {
       backgroundThrottling: false,
     },
     })
+
+    const desktopFriendlyUserAgent = app.userAgentFallback.replace(/\sElectron\/[^\s]+/i, '')
+    mainWindow.webContents.setUserAgent(desktopFriendlyUserAgent)
 
     mainWindow.once('ready-to-show', () => {
         mainWindow.show()
@@ -329,6 +391,31 @@ ipcMain.handle('music:resolve-youtube-search', async (_event, query) => {
 })
 
 app.whenReady().then(() => {
+    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+        callback(ALLOWED_PERMISSIONS.has(permission))
+    })
+
+    session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+        if (!ALLOWED_PERMISSIONS.has(permission)) {
+            return false
+        }
+
+        if (!requestingOrigin || requestingOrigin === 'null') {
+            return true
+        }
+
+        try {
+            const origin = new URL(requestingOrigin)
+            return origin.hostname === '127.0.0.1' || origin.hostname === 'localhost'
+        } catch {
+            return false
+        }
+    })
+
+    if (typeof session.defaultSession.setDevicePermissionHandler === 'function') {
+        session.defaultSession.setDevicePermissionHandler((_details) => true)
+    }
+
     session.defaultSession.setDisplayMediaRequestHandler(
         async (_request, callback) => {
             try {
