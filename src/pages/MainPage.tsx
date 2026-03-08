@@ -100,6 +100,7 @@ export function MainPage() {
   const setActiveChannel = useAppStore((state) => state.setActiveChannel)
   const voiceChannelId = useAppStore((state) => state.voiceChannelId)
   const setVoiceChannelId = useAppStore((state) => state.setVoiceChannelId)
+  const isElectronRuntime = typeof window !== 'undefined' && Boolean(window.electronAPI)
   const { messages, loading: messagesLoading, sendMessage, clearChannelMessages, messagesEndRef } = useMessages(activeChannel?.id || null)
   const { isPlaying, currentSong, addToQueue, nextSong, stopSong } = useMusic(voiceChannelId)
   const { toggleMute, toggleDeafen, startScreenShare, stopScreenShare, isMuted, isDeafened, isScreenSharing, speakingUsers, isConnected, participants, remoteStreams, screenShareStream } = useVoice(voiceChannelId)
@@ -116,7 +117,7 @@ export function MainPage() {
   const [songProgress, setSongProgress] = useState(0)
   const [songTimeLabel, setSongTimeLabel] = useState('0:00 / 0:00')
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false)
-  const [useElectronRendererFallback, setUseElectronRendererFallback] = useState(false)
+  const [useElectronRendererFallback, setUseElectronRendererFallback] = useState(isElectronRuntime)
   const [watchingScreen, setWatchingScreen] = useState<{ userId: string; nickname: string } | null>(null)
   const [isWatchingScreenFullscreen, setIsWatchingScreenFullscreen] = useState(false)
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0)
@@ -141,7 +142,6 @@ export function MainPage() {
   const endedSongIdRef = useRef<string | null>(null)
   const isSongOwner = Boolean(currentSong && user?.id === currentSong.user_id)
   const currentSongId = currentSong?.id ?? null
-  const isElectronRuntime = typeof window !== 'undefined' && Boolean(window.electronAPI)
   const useElectronMusicBridge = isElectronRuntime && !useElectronRendererFallback
 
   const isSearchSource = (value: string) => value.startsWith('ytsearch:')
@@ -423,6 +423,17 @@ export function MainPage() {
       window.clearTimeout(electronPlaybackBootTimeoutRef.current)
       electronPlaybackBootTimeoutRef.current = null
     }
+  }, [])
+
+  const hasElectronPlaybackStarted = useCallback((snapshot: ElectronMusicState | null | undefined, expectedSongId?: string | null) => {
+    if (!snapshot) return false
+    if (expectedSongId && snapshot.songId !== expectedSongId) return false
+
+    const hasDuration = Number.isFinite(snapshot.duration) && snapshot.duration > 0
+    const hasTimeProgress = Number.isFinite(snapshot.currentTime) && snapshot.currentTime > 0
+    const isActiveState = snapshot.playerState === 1 || snapshot.playerState === 2 || snapshot.playerState === 3
+
+    return hasDuration && (isActiveState || hasTimeProgress)
   }, [])
 
   const startProgressTimer = useCallback(() => {
@@ -717,10 +728,7 @@ export function MainPage() {
     const applyState = (snapshot: ElectronMusicState) => {
       setElectronMusicState(snapshot)
 
-      if (
-        snapshot.songId === currentSong?.id &&
-        (snapshot.isReady || snapshot.duration > 0 || snapshot.playerState === 1 || snapshot.playerState === 2 || snapshot.playerState === 3)
-      ) {
+      if (hasElectronPlaybackStarted(snapshot, currentSong?.id)) {
         clearElectronPlaybackBootTimeout()
       }
 
@@ -789,7 +797,7 @@ export function MainPage() {
     return window.electronAPI.onMusicStateChange((snapshot) => {
       applyState(snapshot)
     })
-  }, [broadcastMusicSync, clearElectronPlaybackBootTimeout, currentSong, formatDuration, handleNextSong, isSongOwner, useElectronMusicBridge, user?.id])
+  }, [broadcastMusicSync, clearElectronPlaybackBootTimeout, currentSong, formatDuration, handleNextSong, hasElectronPlaybackStarted, isSongOwner, useElectronMusicBridge, user?.id])
 
   useEffect(() => {
     const pending = pendingMusicSyncRef.current
@@ -939,11 +947,7 @@ export function MainPage() {
           void electronAPI.getMusicState().then((snapshot) => {
             if (cancelled) return
 
-            const hasStarted =
-              snapshot?.songId === currentSong.id &&
-              (snapshot.isReady || snapshot.duration > 0 || snapshot.playerState === 1 || snapshot.playerState === 2 || snapshot.playerState === 3)
-
-            if (hasStarted) {
+            if (hasElectronPlaybackStarted(snapshot, currentSong.id)) {
               return
             }
 
@@ -1194,7 +1198,7 @@ export function MainPage() {
       playerSessionRef.current += 1
       destroyPlayerSafely()
     }
-  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, isElectronRuntime, useElectronMusicBridge, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearElectronPlaybackBootTimeout, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, configurePlayerFrame, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, isElectronRuntime, useElectronMusicBridge, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearElectronPlaybackBootTimeout, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, configurePlayerFrame, destroyPlayerSafely, handleNextSong, hasElectronPlaybackStarted, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
 
   const renderMusicPlayer = () => {
     if (useElectronMusicBridge) return null
