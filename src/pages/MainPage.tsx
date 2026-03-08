@@ -116,6 +116,7 @@ export function MainPage() {
   const [songProgress, setSongProgress] = useState(0)
   const [songTimeLabel, setSongTimeLabel] = useState('0:00 / 0:00')
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false)
+  const [useElectronRendererFallback, setUseElectronRendererFallback] = useState(false)
   const [watchingScreen, setWatchingScreen] = useState<{ userId: string; nickname: string } | null>(null)
   const [isWatchingScreenFullscreen, setIsWatchingScreenFullscreen] = useState(false)
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0)
@@ -127,6 +128,7 @@ export function MainPage() {
   const playerRecoveryTimeoutRef = useRef<number | null>(null)
   const playerStartTimeoutRef = useRef<number | null>(null)
   const progressTimerRef = useRef<number | null>(null)
+  const electronPlaybackBootTimeoutRef = useRef<number | null>(null)
   const playerSessionRef = useRef(0)
   const hasPlaybackStartedRef = useRef(false)
   const isSkippingRef = useRef(false)
@@ -140,6 +142,7 @@ export function MainPage() {
   const isSongOwner = Boolean(currentSong && user?.id === currentSong.user_id)
   const currentSongId = currentSong?.id ?? null
   const isElectronRuntime = typeof window !== 'undefined' && Boolean(window.electronAPI)
+  const useElectronMusicBridge = isElectronRuntime && !useElectronRendererFallback
 
   const isSearchSource = (value: string) => value.startsWith('ytsearch:')
   const toSearchQuery = (value: string) => decodeURIComponent(value.slice('ytsearch:'.length))
@@ -363,7 +366,7 @@ export function MainPage() {
   }, [])
 
   const updateProgressFromPlayer = useCallback(() => {
-    if (isElectronRuntime) {
+    if (useElectronMusicBridge) {
       const duration = electronMusicState?.duration ?? 0
       const currentTime = electronMusicState?.currentTime ?? 0
 
@@ -392,7 +395,7 @@ export function MainPage() {
 
     setSongProgress(Math.min(100, (currentTime / duration) * 100))
     setSongTimeLabel(`${formatDuration(currentTime)} / ${formatDuration(duration)}`)
-  }, [electronMusicState?.currentTime, electronMusicState?.duration, formatDuration, isElectronRuntime])
+  }, [electronMusicState?.currentTime, electronMusicState?.duration, formatDuration, useElectronMusicBridge])
 
   const stopProgressTimer = useCallback(() => {
     if (progressTimerRef.current !== null) {
@@ -412,6 +415,13 @@ export function MainPage() {
     if (playerStartTimeoutRef.current !== null) {
       window.clearTimeout(playerStartTimeoutRef.current)
       playerStartTimeoutRef.current = null
+    }
+  }, [])
+
+  const clearElectronPlaybackBootTimeout = useCallback(() => {
+    if (electronPlaybackBootTimeoutRef.current !== null) {
+      window.clearTimeout(electronPlaybackBootTimeoutRef.current)
+      electronPlaybackBootTimeoutRef.current = null
     }
   }, [])
 
@@ -481,7 +491,7 @@ export function MainPage() {
   }, [])
 
   const getPlayerCurrentTime = useCallback(() => {
-    if (isElectronRuntime) {
+    if (useElectronMusicBridge) {
       return electronMusicState?.currentTime ?? 0
     }
 
@@ -494,16 +504,16 @@ export function MainPage() {
     } catch {
       return 0
     }
-  }, [electronMusicState?.currentTime, isElectronRuntime])
+  }, [electronMusicState?.currentTime, useElectronMusicBridge])
 
   const getSyncedPlaybackPosition = useCallback(async () => {
-    if (isElectronRuntime && window.electronAPI) {
+    if (useElectronMusicBridge && window.electronAPI) {
       const snapshot = await window.electronAPI.getMusicState()
       return snapshot?.currentTime ?? 0
     }
 
     return getPlayerCurrentTime()
-  }, [getPlayerCurrentTime, isElectronRuntime])
+  }, [getPlayerCurrentTime, useElectronMusicBridge])
 
 
   useEffect(() => {
@@ -515,10 +525,10 @@ export function MainPage() {
     if (didRun) {
       updateProgressFromPlayer()
     }
-    if (isElectronRuntime && window.electronAPI) {
+    if (useElectronMusicBridge && window.electronAPI) {
       void window.electronAPI.setMusicMuted(isDeafened)
     }
-  }, [isDeafened, isElectronRuntime, runPlayerCommand, updateProgressFromPlayer])
+  }, [isDeafened, runPlayerCommand, updateProgressFromPlayer, useElectronMusicBridge])
 
   const broadcastMusicSync = useCallback(async (payload: MusicSyncPayload) => {
     if (!voiceChannelId || !musicSyncChannelRef.current) return
@@ -535,7 +545,7 @@ export function MainPage() {
   }, [voiceChannelId])
 
   const applyRestartPlayback = useCallback((startAtSeconds = 0) => {
-    if (isElectronRuntime && window.electronAPI && currentSong) {
+    if (useElectronMusicBridge && window.electronAPI && currentSong) {
       void window.electronAPI.playMusic({
         songId: currentSong.id,
         url: currentSong.youtube_url,
@@ -563,10 +573,10 @@ export function MainPage() {
     startProgressTimer()
     updateProgressFromPlayer()
     return true
-  }, [currentSong, isDeafened, isElectronRuntime, runPlayerCommand, startProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, isDeafened, runPlayerCommand, startProgressTimer, updateProgressFromPlayer, useElectronMusicBridge])
 
   const applyResumePlayback = useCallback((startAtSeconds?: number) => {
-    if (isElectronRuntime && window.electronAPI && currentSong) {
+    if (useElectronMusicBridge && window.electronAPI && currentSong) {
       const shouldBootPlayer =
         !electronMusicState?.songId ||
         electronMusicState.songId !== currentSong.id ||
@@ -602,10 +612,10 @@ export function MainPage() {
     setIsPlaybackPaused(false)
     startProgressTimer()
     return true
-  }, [currentSong, electronMusicState?.playerState, electronMusicState?.songId, isDeafened, isElectronRuntime, runPlayerCommand, startProgressTimer])
+  }, [currentSong, electronMusicState?.playerState, electronMusicState?.songId, isDeafened, runPlayerCommand, startProgressTimer, useElectronMusicBridge])
 
   const applyPausePlayback = useCallback((seekToSeconds?: number) => {
-    if (isElectronRuntime && window.electronAPI) {
+    if (useElectronMusicBridge && window.electronAPI) {
       if (!electronMusicState?.songId) return false
       void window.electronAPI.pauseMusic(seekToSeconds)
       setIsPlaybackPaused(true)
@@ -624,7 +634,7 @@ export function MainPage() {
     stopProgressTimer()
     updateProgressFromPlayer()
     return true
-  }, [electronMusicState?.songId, isElectronRuntime, runPlayerCommand, stopProgressTimer, updateProgressFromPlayer])
+  }, [electronMusicState?.songId, runPlayerCommand, stopProgressTimer, updateProgressFromPlayer, useElectronMusicBridge])
 
   const handlePreviousSong = useCallback(() => {
     if (isMusicControlBusyRef.current) return
@@ -702,10 +712,17 @@ export function MainPage() {
   }, [applyPausePlayback, applyResumePlayback, broadcastMusicSync, currentSong, getSyncedPlaybackPosition, isPlaybackPaused, user?.id])
 
   useEffect(() => {
-    if (!isElectronRuntime || !window.electronAPI) return
+    if (!useElectronMusicBridge || !window.electronAPI) return
 
     const applyState = (snapshot: ElectronMusicState) => {
       setElectronMusicState(snapshot)
+
+      if (
+        snapshot.songId === currentSong?.id &&
+        (snapshot.isReady || snapshot.duration > 0 || snapshot.playerState === 1 || snapshot.playerState === 2 || snapshot.playerState === 3)
+      ) {
+        clearElectronPlaybackBootTimeout()
+      }
 
       if (!Number.isFinite(snapshot.duration) || snapshot.duration <= 0) {
         setSongProgress(0)
@@ -772,7 +789,7 @@ export function MainPage() {
     return window.electronAPI.onMusicStateChange((snapshot) => {
       applyState(snapshot)
     })
-  }, [broadcastMusicSync, currentSong, formatDuration, handleNextSong, isElectronRuntime, isSongOwner, user?.id])
+  }, [broadcastMusicSync, clearElectronPlaybackBootTimeout, currentSong, formatDuration, handleNextSong, isSongOwner, useElectronMusicBridge, user?.id])
 
   useEffect(() => {
     const pending = pendingMusicSyncRef.current
@@ -847,9 +864,10 @@ export function MainPage() {
 
   useEffect(() => {
     const source = currentSong?.youtube_url
-    if (!voiceChannelId || !source || (!isElectronRuntime && !playerHostRef.current) || !isConnected) {
+    if (!voiceChannelId || !source || (!useElectronMusicBridge && !playerHostRef.current) || !isConnected) {
       stopProgressTimer()
       clearPlayerRecoveryTimeout()
+      clearElectronPlaybackBootTimeout()
       setIsPlaybackPaused(false)
       playerSessionRef.current += 1
       destroyPlayerSafely()
@@ -859,11 +877,12 @@ export function MainPage() {
       return
     }
 
-    if (isElectronRuntime && window.electronAPI) {
+    if (useElectronMusicBridge && window.electronAPI) {
       const electronAPI = window.electronAPI
 
       stopProgressTimer()
       clearPlayerRecoveryTimeout()
+       clearElectronPlaybackBootTimeout()
       destroyPlayerSafely()
 
       let cancelled = false
@@ -914,10 +933,34 @@ export function MainPage() {
             })
           }, 250)
         }
+
+        clearElectronPlaybackBootTimeout()
+        electronPlaybackBootTimeoutRef.current = window.setTimeout(() => {
+          void electronAPI.getMusicState().then((snapshot) => {
+            if (cancelled) return
+
+            const hasStarted =
+              snapshot?.songId === currentSong.id &&
+              (snapshot.isReady || snapshot.duration > 0 || snapshot.playerState === 1 || snapshot.playerState === 2 || snapshot.playerState === 3)
+
+            if (hasStarted) {
+              return
+            }
+
+            console.error('Electron hidden music player stayed idle, switching to renderer fallback.', snapshot)
+            void electronAPI.stopMusic()
+            setElectronMusicState(null)
+            setSongProgress(0)
+            setSongTimeLabel('0:00 / 0:00')
+            setUseElectronRendererFallback(true)
+            setPlayerNonce((prev) => prev + 1)
+          })
+        }, 4500)
       })()
 
       return () => {
         cancelled = true
+        clearElectronPlaybackBootTimeout()
         if (!currentSong?.id) {
           void electronAPI.stopMusic()
         }
@@ -934,7 +977,7 @@ export function MainPage() {
       ? window.location.origin
       : undefined
     const effectivePlayerOrigin = disablePlayerOriginRef.current ? undefined : playerOrigin
-    const playerHost = isElectronRuntime ? 'https://www.youtube-nocookie.com' : undefined
+    const playerHost = isElectronRuntime ? 'https://www.youtube.com' : undefined
 
     void ensureYouTubeApi()
       .then(async (yt) => {
@@ -1151,10 +1194,10 @@ export function MainPage() {
       playerSessionRef.current += 1
       destroyPlayerSafely()
     }
-  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, isElectronRuntime, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, configurePlayerFrame, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, isElectronRuntime, useElectronMusicBridge, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearElectronPlaybackBootTimeout, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, configurePlayerFrame, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
 
   const renderMusicPlayer = () => {
-    if (isElectronRuntime) return null
+    if (useElectronMusicBridge) return null
     if (!currentSong || !voiceChannelId) return null
 
     return (
@@ -1274,7 +1317,7 @@ export function MainPage() {
           </div>
         </div>
         <div style={{ height: '4px', borderRadius: '999px', background: 'rgba(255,255,255,0.08)', overflow: 'hidden', cursor: 'pointer' }} onClick={(event) => {
-          if (isElectronRuntime && window.electronAPI) {
+          if (useElectronMusicBridge && window.electronAPI) {
             const rect = event.currentTarget.getBoundingClientRect()
             const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width))
             const duration = electronMusicState?.duration ?? 0
