@@ -133,9 +133,13 @@ export function useMusic(channelId: string | null) {
             const normalizedUrl = normalizeYouTubeInput(normalizedInput)
             const resolvedSource = await resolveYouTubeSource(normalizedInput)
             const resolvedTitle = resolvedSource?.title
+            const isElectronRuntime = typeof window !== 'undefined' && Boolean(window.electronAPI)
 
             let source = resolvedSource?.source ?? null
             if (!source && !normalizedUrl && normalizedInput) {
+                if (isElectronRuntime) {
+                    return { success: false, error: 'Sarki cozumlenemedi. Lutfen dogrudan YouTube linki gir veya tekrar dene.' }
+                }
                 source = `ytsearch:${encodeURIComponent(normalizedInput)}`
             }
 

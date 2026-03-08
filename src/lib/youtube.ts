@@ -32,6 +32,9 @@ export const normalizeYouTubeInput = (value: string) => {
 export const extractFirstVideoMatch = (value: string) => {
   const patterns = [
     /https?:\/\/www\.youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})/i,
+    /https?:\/\/youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})/i,
+    /\/watch\?v=([A-Za-z0-9_-]{11})/i,
+    /\\"videoId\\":\\"([A-Za-z0-9_-]{11})\\"/i,
     /watch\?v=([A-Za-z0-9_-]{11})/i,
     /"videoId":"([A-Za-z0-9_-]{11})"/i,
   ]
