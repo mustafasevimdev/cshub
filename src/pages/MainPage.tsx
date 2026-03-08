@@ -32,6 +32,9 @@ const UI = {
   noPeople: 'Kimse yok...',
   connecting: 'Ba\u011flan\u0131l\u0131yor...',
   yourStream: 'Senin yay\u0131n\u0131n',
+  watchScreen: 'Ekrani izle',
+  fullscreen: 'Tam ekran',
+  exitFullscreen: 'Tam ekrandan cik',
   playing: 'Oynat\u0131l\u0131yor',
   paused: 'Duraklat\u0131ld\u0131',
   resume: 'Devam',
@@ -114,9 +117,11 @@ export function MainPage() {
   const [songTimeLabel, setSongTimeLabel] = useState('0:00 / 0:00')
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false)
   const [watchingScreen, setWatchingScreen] = useState<{ userId: string; nickname: string } | null>(null)
+  const [isWatchingScreenFullscreen, setIsWatchingScreenFullscreen] = useState(false)
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const playerHostRef = useRef<HTMLDivElement | null>(null)
+  const watchingScreenVideoRef = useRef<HTMLVideoElement | null>(null)
   const playerRef = useRef<YT.Player | null>(null)
   const playerReadyRef = useRef(false)
   const playerRecoveryTimeoutRef = useRef<number | null>(null)
@@ -162,6 +167,32 @@ export function MainPage() {
 
   const hasVideoTrack = useCallback((stream: MediaStream | undefined | null) => {
     return Boolean(stream && stream.getVideoTracks().length > 0)
+  }, [])
+
+  const exitWatchingScreenFullscreen = useCallback(async () => {
+    if (!document.fullscreenElement) return
+
+    try {
+      await document.exitFullscreen()
+    } catch (error) {
+      console.error('Failed to exit fullscreen screen watch mode:', error)
+    }
+  }, [])
+
+  const toggleWatchingScreenFullscreen = useCallback(async () => {
+    const videoElement = watchingScreenVideoRef.current
+    if (!videoElement) return
+
+    try {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen()
+        return
+      }
+
+      await videoElement.requestFullscreen()
+    } catch (error) {
+      console.error('Failed to toggle fullscreen screen watch mode:', error)
+    }
   }, [])
 
   const handleSendMessage = async () => {
@@ -259,6 +290,11 @@ export function MainPage() {
     if (file) await updateAvatar(file)
   }
 
+  const handleCloseWatchingScreen = useCallback(() => {
+    void exitWatchingScreenFullscreen()
+    setWatchingScreen(null)
+  }, [exitWatchingScreenFullscreen])
+
   const formatTime = (dateString: string) => new Date(dateString).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
   const getDefaultAvatar = (nickname: string) => `https://api.dicebear.com/7.x/initials/svg?seed=${nickname}&backgroundColor=5865F2`
   const filteredCommands = useMemo(
@@ -276,6 +312,25 @@ export function MainPage() {
 
     setSelectedCommandIndex((current) => Math.min(current, filteredCommands.length - 1))
   }, [filteredCommands])
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsWatchingScreenFullscreen(Boolean(document.fullscreenElement && watchingScreenVideoRef.current && document.fullscreenElement.contains(watchingScreenVideoRef.current)))
+    }
+
+    document.addEventListener('fullscreenchange', handleFullscreenChange)
+    handleFullscreenChange()
+
+    return () => {
+      document.removeEventListener('fullscreenchange', handleFullscreenChange)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!watchingScreen && document.fullscreenElement) {
+      void exitWatchingScreenFullscreen()
+    }
+  }, [exitWatchingScreenFullscreen, watchingScreen])
 
   const applyCommandSelection = (command: { cmd: string }) => {
     setMessageInput(`${command.cmd} `)
@@ -805,24 +860,66 @@ export function MainPage() {
     }
 
     if (isElectronRuntime && window.electronAPI) {
+      const electronAPI = window.electronAPI
+
       stopProgressTimer()
       clearPlayerRecoveryTimeout()
       destroyPlayerSafely()
 
-      if (isSearchSource(source)) {
-        return
-      }
+      let cancelled = false
 
-      void window.electronAPI.playMusic({
-        songId: currentSong.id,
-        url: source,
-        startAt: 0,
-        muted: isDeafened,
-      })
+      void (async () => {
+        let playbackSource = source
+
+        if (isSearchSource(source)) {
+          const resolved = await resolveYouTubeSource(toSearchQuery(source))
+          if (cancelled || !currentSong) return
+
+          if (!resolved?.source) {
+            console.error('Electron music player could not resolve search source:', source)
+            return
+          }
+
+          playbackSource = resolved.source
+
+          if (resolved.source !== source) {
+            void supabase
+              .from('music_queue')
+              .update({ youtube_url: resolved.source, title: resolved.title ?? currentSong.title } as never)
+              .eq('id', currentSong.id)
+              .then(({ error }) => {
+                if (error) {
+                  console.error('Failed to persist resolved Electron playback source:', error)
+                }
+              })
+          }
+        }
+
+        const started = await electronAPI.playMusic({
+          songId: currentSong.id,
+          url: playbackSource,
+          startAt: 0,
+          muted: isDeafened,
+        })
+
+        if (!started && !cancelled) {
+          window.setTimeout(() => {
+            if (cancelled) return
+
+            void electronAPI.playMusic({
+              songId: currentSong.id,
+              url: playbackSource,
+              startAt: 0,
+              muted: isDeafened,
+            })
+          }, 250)
+        }
+      })()
 
       return () => {
+        cancelled = true
         if (!currentSong?.id) {
-          void window.electronAPI?.stopMusic()
+          void electronAPI.stopMusic()
         }
       }
     }
@@ -1412,7 +1509,7 @@ export function MainPage() {
                       )}
                       {participants.filter((p) => p.is_screen_sharing && hasVideoTrack(remoteStreams.get(p.user_id))).map((participant) => (
                         <button key={participant.id} className="btn btn-primary" style={{ fontSize: '13px', padding: '6px 14px', display: 'flex', alignItems: 'center', gap: '6px' }} onClick={() => setWatchingScreen({ userId: participant.user_id, nickname: participant.user?.nickname || UI.unknownUser })}>
-                          {Icons.share} {`${participant.user?.nickname || UI.unknownUser} ekranini gor`}
+                          {Icons.share} {`${participant.user?.nickname || UI.unknownUser} ${UI.watchScreen.toLowerCase()}`}
                         </button>
                       ))}
                     </div>
@@ -1558,13 +1655,30 @@ export function MainPage() {
         const stream = isSelf ? screenShareStream : (remoteStreams.get(watchingScreen.userId) ?? null)
         if (!hasVideoTrack(stream)) return null
         return (
-          <div className="modal-overlay" style={{ background: 'rgba(0,0,0,0.92)', zIndex: 9999, cursor: 'default' }} onClick={() => setWatchingScreen(null)}>
+          <div className="modal-overlay" style={{ background: 'rgba(0,0,0,0.92)', zIndex: 9999, cursor: 'default' }} onClick={handleCloseWatchingScreen}>
             <div style={{ width: '90vw', maxWidth: '1400px', display: 'flex', flexDirection: 'column', gap: '12px' }} onClick={(e) => e.stopPropagation()}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0 4px' }}>
                 <span style={{ fontWeight: 700, fontSize: '15px', color: 'white' }}>{isSelf ? UI.yourStream : `${watchingScreen.nickname} ekrani`}</span>
-                <button className="btn" style={{ padding: '6px 16px', fontSize: '13px', background: 'var(--danger)', color: 'white' }} onClick={() => setWatchingScreen(null)}>Kapat</button>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <button className="btn btn-secondary" style={{ padding: '6px 16px', fontSize: '13px' }} onClick={() => void toggleWatchingScreenFullscreen()}>
+                    {isWatchingScreenFullscreen ? UI.exitFullscreen : UI.fullscreen}
+                  </button>
+                  <button className="btn" style={{ padding: '6px 16px', fontSize: '13px', background: 'var(--danger)', color: 'white' }} onClick={handleCloseWatchingScreen}>Kapat</button>
+                </div>
               </div>
-              <video autoPlay playsInline muted={isSelf} ref={(el) => { if (el) el.srcObject = stream }} style={{ width: '100%', borderRadius: '8px', background: '#000' }} />
+              <video
+                autoPlay
+                playsInline
+                muted={isSelf}
+                ref={(el) => {
+                  watchingScreenVideoRef.current = el
+                  if (el) {
+                    el.srcObject = stream
+                  }
+                }}
+                onDoubleClick={() => void toggleWatchingScreenFullscreen()}
+                style={{ width: '100%', borderRadius: '8px', background: '#000', cursor: 'zoom-in' }}
+              />
             </div>
           </div>
         )

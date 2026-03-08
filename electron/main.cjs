@@ -8,6 +8,8 @@ let tray = null
 let isQuitting = false
 let rendererServer = null
 let rendererServerUrl = null
+let musicPlayerServer = null
+let musicPlayerServerUrl = null
 let musicWindow = null
 let musicWindowReadyPromise = null
 let musicStatePollInterval = null
@@ -61,6 +63,10 @@ const MIME_TYPES = {
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 
+function getDesktopFriendlyUserAgent() {
+    return app.userAgentFallback.replace(/\sElectron\/[^\s]+/i, '')
+}
+
 function extractYouTubeVideoIdFromUrl(value) {
     if (typeof value !== 'string') return null
 
@@ -103,9 +109,17 @@ function buildMusicPlayerHtml() {
         let currentVideoId = null
         let currentSongId = null
         let mutedState = true
+        let startRetryTimeout = null
 
         const emit = (type, payload) => {
           console.log(type + JSON.stringify(payload))
+        }
+
+        const clearStartRetryTimeout = () => {
+          if (startRetryTimeout !== null) {
+            window.clearTimeout(startRetryTimeout)
+            startRetryTimeout = null
+          }
         }
 
         const getSnapshot = () => {
@@ -148,6 +162,7 @@ function buildMusicPlayerHtml() {
         })
 
         const destroyPlayer = () => {
+          clearStartRetryTimeout()
           if (!player) return
           try {
             player.destroy()
@@ -164,10 +179,14 @@ function buildMusicPlayerHtml() {
           currentSongId = songId ?? null
           mutedState = Boolean(muted)
 
+          const playerOrigin = window.location.origin && window.location.origin !== 'null'
+            ? window.location.origin
+            : undefined
+
           player = new window.YT.Player('player', {
             width: '320',
             height: '180',
-            host: 'https://www.youtube-nocookie.com',
+            host: 'https://www.youtube.com',
             videoId,
             playerVars: {
               autoplay: 1,
@@ -179,6 +198,8 @@ function buildMusicPlayerHtml() {
               playsinline: 1,
               rel: 0,
               mute: 1,
+              enablejsapi: 1,
+              origin: playerOrigin,
             },
             events: {
               onReady: (event) => {
@@ -188,10 +209,21 @@ function buildMusicPlayerHtml() {
                 }
                 event.target.mute()
                 event.target.playVideo()
+                clearStartRetryTimeout()
+                startRetryTimeout = window.setTimeout(() => {
+                  const playerState = player?.getPlayerState?.() ?? -1
+                  if (playerState !== 1) {
+                    try {
+                      player?.playVideo?.()
+                    } catch {}
+                    emit('__CSHUB_MUSIC_WARN__', { type: 'playback-unstarted-retry', songId: currentSongId, videoId: currentVideoId, playerState })
+                  }
+                }, 2500)
                 emitState()
               },
               onStateChange: (event) => {
                 if (event.data === 1) {
+                  clearStartRetryTimeout()
                   if (mutedState) event.target.mute()
                   else event.target.unMute()
                 }
@@ -305,6 +337,7 @@ async function ensureMusicWindow() {
     musicWindow.setIgnoreMouseEvents(true)
     musicWindow.setVisibleOnAllWorkspaces(false)
     musicWindow.webContents.setAudioMuted(false)
+    musicWindow.webContents.setUserAgent(getDesktopFriendlyUserAgent())
     musicWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
     musicWindow.on('closed', () => {
         musicWindow = null
@@ -333,11 +366,29 @@ async function ensureMusicWindow() {
 
         if (message.startsWith('__CSHUB_MUSIC_ERROR__')) {
             console.error('Hidden music player error:', message.slice('__CSHUB_MUSIC_ERROR__'.length))
+            return
+        }
+
+        if (message.startsWith('__CSHUB_MUSIC_WARN__')) {
+            console.warn('Hidden music player warning:', message.slice('__CSHUB_MUSIC_WARN__'.length))
         }
     })
 
-    const pageUrl = `data:text/html;charset=UTF-8,${encodeURIComponent(buildMusicPlayerHtml())}`
-    musicWindowReadyPromise = musicWindow.loadURL(pageUrl).then(() => {
+    musicWindowReadyPromise = startMusicPlayerServer().then((pageUrl) => musicWindow.loadURL(pageUrl)).then(async () => {
+        await musicWindow.webContents.executeJavaScript(
+            `new Promise((resolve) => {
+                const check = () => {
+                    if (window.__CSHUB_PLAYER__) {
+                        resolve(true)
+                        return
+                    }
+                    window.setTimeout(check, 25)
+                }
+                check()
+            })`,
+            true,
+        )
+
         if (musicStatePollInterval !== null) {
             clearInterval(musicStatePollInterval)
         }
@@ -573,6 +624,34 @@ async function serveRendererRequest(req, res) {
     }
 }
 
+async function startMusicPlayerServer() {
+    if (musicPlayerServerUrl) return musicPlayerServerUrl
+
+    musicPlayerServerUrl = await new Promise((resolve, reject) => {
+        const server = http.createServer((_req, res) => {
+            res.writeHead(200, {
+                'Cache-Control': 'no-store',
+                'Content-Type': 'text/html; charset=utf-8',
+            })
+            res.end(buildMusicPlayerHtml())
+        })
+
+        server.once('error', reject)
+        server.listen(0, '127.0.0.1', () => {
+            const address = server.address()
+            if (!address || typeof address === 'string') {
+                reject(new Error('Failed to start music player server'))
+                return
+            }
+
+            musicPlayerServer = server
+            resolve(`http://127.0.0.1:${address.port}`)
+        })
+    })
+
+    return musicPlayerServerUrl
+}
+
 async function startRendererServer() {
     if (rendererServerUrl) return rendererServerUrl
 
@@ -622,8 +701,7 @@ async function createWindow() {
     },
     })
 
-    const desktopFriendlyUserAgent = app.userAgentFallback.replace(/\sElectron\/[^\s]+/i, '')
-    mainWindow.webContents.setUserAgent(desktopFriendlyUserAgent)
+    mainWindow.webContents.setUserAgent(getDesktopFriendlyUserAgent())
 
     mainWindow.once('ready-to-show', () => {
         mainWindow.show()
@@ -881,6 +959,9 @@ app.on('before-quit', () => {
         musicWindow.destroy()
         musicWindow = null
     }
+    musicPlayerServer?.close()
+    musicPlayerServer = null
+    musicPlayerServerUrl = null
     rendererServer?.close()
 })
 
