@@ -9,8 +9,8 @@ let isQuitting = false
 let rendererServer = null
 let rendererServerUrl = null
 
-const YOUTUBE_SEARCH_BASE = 'https://www.youtube.com/results?hl=tr&persist_hl=1&search_query='
-const YOUTUBE_SEARCH_FALLBACK_BASE = 'https://r.jina.ai/http://www.youtube.com/results?hl=tr&persist_hl=1&search_query='
+const YOUTUBE_SEARCH_BASE = 'https://www.youtube.com/results?hl=tr&gl=TR&persist_hl=1&persist_gl=1&has_verified=1&bpctr=9999999999&search_query='
+const YOUTUBE_SEARCH_FALLBACK_BASE = 'https://r.jina.ai/http://www.youtube.com/results?hl=tr&gl=TR&persist_hl=1&persist_gl=1&has_verified=1&bpctr=9999999999&search_query='
 const SEARCH_TIMEOUT_MS = 3000
 const SEARCH_CACHE_TTL_MS = 30 * 60 * 1000
 const ALLOWED_PERMISSIONS = new Set([
@@ -21,6 +21,13 @@ const ALLOWED_PERMISSIONS = new Set([
     'media',
     'videoCapture',
 ])
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost'])
+const TRUSTED_EMBED_HOST_SUFFIXES = [
+    'youtube.com',
+    'youtu.be',
+    'googlevideo.com',
+    'ytimg.com',
+]
 const searchCache = new Map()
 const pendingSearches = new Map()
 const DIST_DIR = path.join(__dirname, '../dist')
@@ -42,6 +49,9 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
 function extractFirstYouTubeVideoId(value) {
     const patterns = [
         /https?:\/\/www\.youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})/i,
+        /https?:\/\/youtube\.com\/watch\?v=([A-Za-z0-9_-]{11})/i,
+        /\/watch\?v=([A-Za-z0-9_-]{11})/i,
+        /\\"videoId\\":\\"([A-Za-z0-9_-]{11})\\"/i,
         /watch\?v=([A-Za-z0-9_-]{11})/i,
         /"videoRenderer":\{"videoId":"([A-Za-z0-9_-]{11})"/i,
         /"videoId":"([A-Za-z0-9_-]{11})"/i,
@@ -91,7 +101,10 @@ async function requestSearchPayload(baseUrl, query) {
     try {
         const response = await fetch(`${baseUrl}${encodeURIComponent(normalizedQuery)}`, {
             headers: {
+                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'accept-language': 'tr-TR,tr;q=0.9,en;q=0.8',
+                cookie: 'CONSENT=YES+cb.20210328-17-p0.en+FX+111',
+                referer: 'https://www.youtube.com/',
                 'user-agent': 'Mozilla/5.0',
             },
             signal: controller.signal,
@@ -166,6 +179,36 @@ async function resolveYouTubeSearch(query) {
 
 function getContentType(filePath) {
     return MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream'
+}
+
+function getHostFromUrl(urlValue) {
+    if (!urlValue || typeof urlValue !== 'string') return null
+
+    try {
+        return new URL(urlValue).hostname.toLowerCase()
+    } catch {
+        return null
+    }
+}
+
+function isAllowedEmbedHost(hostname) {
+    if (!hostname) return false
+    return TRUSTED_EMBED_HOST_SUFFIXES.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`))
+}
+
+function isTrustedRequestingHost(hostname, permission) {
+    if (!hostname) return false
+
+    if (LOCAL_HOSTS.has(hostname)) {
+        return true
+    }
+
+    // YouTube iframe and stream hosts need media/fullscreen rights for playback.
+    if ((permission === 'media' || permission === 'fullscreen') && isAllowedEmbedHost(hostname)) {
+        return true
+    }
+
+    return false
 }
 
 async function serveRendererRequest(req, res) {
@@ -391,8 +434,14 @@ ipcMain.handle('music:resolve-youtube-search', async (_event, query) => {
 })
 
 app.whenReady().then(() => {
-    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-        callback(ALLOWED_PERMISSIONS.has(permission))
+    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
+        if (!ALLOWED_PERMISSIONS.has(permission)) {
+            callback(false)
+            return
+        }
+
+        const requestingHost = getHostFromUrl(details?.requestingUrl)
+        callback(isTrustedRequestingHost(requestingHost, permission))
     })
 
     session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
@@ -400,16 +449,8 @@ app.whenReady().then(() => {
             return false
         }
 
-        if (!requestingOrigin || requestingOrigin === 'null') {
-            return true
-        }
-
-        try {
-            const origin = new URL(requestingOrigin)
-            return origin.hostname === '127.0.0.1' || origin.hostname === 'localhost'
-        } catch {
-            return false
-        }
+        const requestingHost = getHostFromUrl(requestingOrigin)
+        return isTrustedRequestingHost(requestingHost, permission)
     })
 
     if (typeof session.defaultSession.setDevicePermissionHandler === 'function') {
