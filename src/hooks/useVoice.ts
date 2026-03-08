@@ -82,6 +82,7 @@ export function useVoice(channelId: string | null) {
     const rawLocalStreamRef = useRef<MediaStream | null>(null)
     const screenShareStreamRef = useRef<MediaStream | null>(null)
     const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map())
+    const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map())
     const signalChannelRef = useRef<RealtimeChannel | null>(null)
     const participantsSyncChannelRef = useRef<RealtimeChannel | null>(null)
     const remoteAudioRefs = useRef<Map<string, SinkableAudioElement>>(new Map())
@@ -317,6 +318,7 @@ export function useVoice(channelId: string | null) {
 
         peersRef.current.forEach((peer) => peer.close())
         peersRef.current.clear()
+        pendingIceCandidatesRef.current.clear()
 
         remoteAudioControllersRef.current.forEach((_, targetUserId) => {
             disposeRemoteAudioController(targetUserId)
@@ -456,6 +458,22 @@ export function useVoice(channelId: string | null) {
         [disposeRemoteAudioController, ensureAudioContextRunning, sendSignal, setAudioSinkId, upsertRemoteTrack],
     )
 
+    const flushPendingIceCandidates = useCallback(async (targetUserId: string, peerConnection: RTCPeerConnection) => {
+        const queuedCandidates = pendingIceCandidatesRef.current.get(targetUserId)
+        if (!queuedCandidates || queuedCandidates.length === 0) return
+
+        pendingIceCandidatesRef.current.delete(targetUserId)
+        await Promise.all(
+            queuedCandidates.map(async (candidate) => {
+                try {
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
+                } catch (error) {
+                    console.error('Failed to apply queued ICE candidate:', error)
+                }
+            }),
+        )
+    }, [])
+
     const handleSignal = useCallback(
         async (payload: VoiceSignalPayload) => {
             const { type, fromUserId, data } = payload
@@ -470,6 +488,7 @@ export function useVoice(channelId: string | null) {
             try {
                 if (type === 'offer' && data) {
                     await peerConnection.setRemoteDescription(new RTCSessionDescription(data as RTCSessionDescriptionInit))
+                    await flushPendingIceCandidates(fromUserId, peerConnection)
                     const answer = await peerConnection.createAnswer()
                     await peerConnection.setLocalDescription(answer)
                     await sendSignal('answer', answer, fromUserId)
@@ -478,11 +497,20 @@ export function useVoice(channelId: string | null) {
 
                 if (type === 'answer' && data) {
                     await peerConnection.setRemoteDescription(new RTCSessionDescription(data as RTCSessionDescriptionInit))
+                    await flushPendingIceCandidates(fromUserId, peerConnection)
                     return
                 }
 
                 if (type === 'ice-candidate' && data) {
-                    await peerConnection.addIceCandidate(new RTCIceCandidate(data as RTCIceCandidateInit))
+                    const candidate = data as RTCIceCandidateInit
+                    if (!peerConnection.remoteDescription) {
+                        const queuedCandidates = pendingIceCandidatesRef.current.get(fromUserId) ?? []
+                        queuedCandidates.push(candidate)
+                        pendingIceCandidatesRef.current.set(fromUserId, queuedCandidates)
+                        return
+                    }
+
+                    await peerConnection.addIceCandidate(new RTCIceCandidate(candidate))
                     return
                 }
 
@@ -501,7 +529,7 @@ export function useVoice(channelId: string | null) {
                 console.error('WebRTC Signal Error:', error)
             }
         },
-        [createPeerConnection, sendSignal, userId],
+        [createPeerConnection, flushPendingIceCandidates, sendSignal, userId],
     )
 
     const fetchParticipants = useCallback(async () => {
