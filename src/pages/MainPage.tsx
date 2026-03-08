@@ -109,14 +109,17 @@ export function MainPage() {
   const playerRef = useRef<YT.Player | null>(null)
   const playerReadyRef = useRef(false)
   const playerRecoveryTimeoutRef = useRef<number | null>(null)
+  const playerStartTimeoutRef = useRef<number | null>(null)
   const progressTimerRef = useRef<number | null>(null)
   const playerSessionRef = useRef(0)
+  const hasPlaybackStartedRef = useRef(false)
   const isSkippingRef = useRef(false)
   const isMusicControlBusyRef = useRef(false)
   const musicSyncChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
   const startSyncSentForSongRef = useRef<string | null>(null)
   const pendingMusicSyncRef = useRef<MusicSyncPayload | null>(null)
   const disablePlayerOriginRef = useRef(false)
+  const persistedResolvedSourceForSongRef = useRef<string | null>(null)
   const isSongOwner = Boolean(currentSong && user?.id === currentSong.user_id)
   const currentSongId = currentSong?.id ?? null
 
@@ -254,6 +257,7 @@ export function MainPage() {
   useEffect(() => {
     startSyncSentForSongRef.current = null
     disablePlayerOriginRef.current = false
+    persistedResolvedSourceForSongRef.current = null
     if (!currentSongId && pendingMusicSyncRef.current) {
       pendingMusicSyncRef.current = null
       return
@@ -302,6 +306,13 @@ export function MainPage() {
     }
   }, [])
 
+  const clearPlayerStartTimeout = useCallback(() => {
+    if (playerStartTimeoutRef.current !== null) {
+      window.clearTimeout(playerStartTimeoutRef.current)
+      playerStartTimeoutRef.current = null
+    }
+  }, [])
+
   const startProgressTimer = useCallback(() => {
     stopProgressTimer()
     updateProgressFromPlayer()
@@ -340,7 +351,9 @@ export function MainPage() {
 
   const destroyPlayerSafely = useCallback(() => {
     clearPlayerRecoveryTimeout()
+    clearPlayerStartTimeout()
     playerReadyRef.current = false
+    hasPlaybackStartedRef.current = false
     if (!playerRef.current) return
 
     try {
@@ -350,7 +363,7 @@ export function MainPage() {
     } finally {
       playerRef.current = null
     }
-  }, [clearPlayerRecoveryTimeout])
+  }, [clearPlayerRecoveryTimeout, clearPlayerStartTimeout])
 
   const runPlayerCommand = useCallback((command: (player: YT.Player) => void) => {
     const player = playerRef.current
@@ -680,11 +693,23 @@ export function MainPage() {
                 onReady: (event) => {
                   if (sessionId !== playerSessionRef.current) return
                   playerReadyRef.current = true
+                  hasPlaybackStartedRef.current = false
                   clearPlayerRecoveryTimeout()
+                  clearPlayerStartTimeout()
                   event.target.mute()
                   setIsPlaybackPaused(false)
                   event.target.playVideo()
                   updateProgressFromPlayer()
+
+                  playerStartTimeoutRef.current = window.setTimeout(() => {
+                    if (sessionId !== playerSessionRef.current || hasPlaybackStartedRef.current) return
+
+                    console.error('YouTube player stayed unstarted after onReady, remounting.')
+                    if (!disablePlayerOriginRef.current && playerOrigin) {
+                      disablePlayerOriginRef.current = true
+                    }
+                    setPlayerNonce((prev) => prev + 1)
+                  }, 3000)
 
                 const pending = pendingMusicSyncRef.current
                 if (pending && currentSong && pending.songId === currentSong.id) {
@@ -722,10 +747,50 @@ export function MainPage() {
               onStateChange: (event) => {
                 if (sessionId !== playerSessionRef.current) return
                 if (event.data === yt.PlayerState.PLAYING) {
+                  hasPlaybackStartedRef.current = true
+                  clearPlayerStartTimeout()
                   setIsPlaybackPaused(false)
                   if (isDeafened) event.target.mute()
                   else event.target.unMute()
                   startProgressTimer()
+
+                  if (
+                    isSongOwner &&
+                    currentSong &&
+                    isSearchSource(currentSong.youtube_url) &&
+                    persistedResolvedSourceForSongRef.current !== currentSong.id
+                  ) {
+                    const playerLike = event.target as unknown as {
+                      getVideoUrl?: () => string
+                      getVideoData?: () => { video_id?: string }
+                    }
+
+                    let resolvedPlaybackSource: string | null = null
+                    const resolvedByUrl = playerLike.getVideoUrl?.()
+                    if (typeof resolvedByUrl === 'string' && resolvedByUrl.includes('watch?v=')) {
+                      resolvedPlaybackSource = resolvedByUrl
+                    }
+
+                    if (!resolvedPlaybackSource) {
+                      const resolvedVideoId = playerLike.getVideoData?.()?.video_id
+                      if (typeof resolvedVideoId === 'string' && resolvedVideoId.length === 11) {
+                        resolvedPlaybackSource = `https://www.youtube.com/watch?v=${resolvedVideoId}`
+                      }
+                    }
+
+                    if (resolvedPlaybackSource) {
+                      persistedResolvedSourceForSongRef.current = currentSong.id
+                      void supabase
+                        .from('music_queue')
+                        .update({ youtube_url: resolvedPlaybackSource } as never)
+                        .eq('id', currentSong.id)
+                        .then(({ error }) => {
+                          if (error) {
+                            console.error('Failed to persist active YouTube source from player:', error)
+                          }
+                        })
+                    }
+                  }
                 } else if (event.data === yt.PlayerState.PAUSED) {
                   setIsPlaybackPaused(true)
                   stopProgressTimer()
@@ -734,6 +799,7 @@ export function MainPage() {
                   stopProgressTimer()
                   updateProgressFromPlayer()
                 } else if (event.data === yt.PlayerState.ENDED) {
+                  clearPlayerStartTimeout()
                   setIsPlaybackPaused(false)
                   stopProgressTimer()
                   setSongProgress(100)
@@ -744,7 +810,9 @@ export function MainPage() {
               },
               onError: (event) => {
                 playerReadyRef.current = false
+                hasPlaybackStartedRef.current = false
                 clearPlayerRecoveryTimeout()
+                clearPlayerStartTimeout()
                 if (!disablePlayerOriginRef.current && playerOrigin) {
                   disablePlayerOriginRef.current = true
                   setPlayerNonce((prev) => prev + 1)
@@ -779,7 +847,7 @@ export function MainPage() {
       playerSessionRef.current += 1
       destroyPlayerSafely()
     }
-  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearPlayerRecoveryTimeout, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, destroyPlayerSafely, handleNextSong, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
 
   const renderMusicPlayer = () => {
     if (!currentSong || !voiceChannelId) return null

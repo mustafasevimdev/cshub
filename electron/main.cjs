@@ -19,6 +19,7 @@ const ALLOWED_PERMISSIONS = new Set([
     'display-capture',
     'fullscreen',
     'media',
+    'mediaKeySystem',
     'videoCapture',
 ])
 const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost'])
@@ -434,22 +435,34 @@ ipcMain.handle('music:resolve-youtube-search', async (_event, query) => {
 })
 
 app.whenReady().then(() => {
-    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback, details) => {
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
         if (!ALLOWED_PERMISSIONS.has(permission)) {
             callback(false)
             return
         }
 
-        const requestingHost = getHostFromUrl(details?.requestingUrl)
+        const requestingHost = getHostFromUrl(details?.requestingUrl) ??
+            getHostFromUrl(details?.embeddingOrigin) ??
+            getHostFromUrl(webContents?.getURL?.())
+
+        if (!requestingHost) {
+            callback(permission === 'media' || permission === 'fullscreen' || permission === 'mediaKeySystem')
+            return
+        }
+
         callback(isTrustedRequestingHost(requestingHost, permission))
     })
 
-    session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) => {
+    session.defaultSession.setPermissionCheckHandler((webContents, permission, requestingOrigin) => {
         if (!ALLOWED_PERMISSIONS.has(permission)) {
             return false
         }
 
-        const requestingHost = getHostFromUrl(requestingOrigin)
+        const requestingHost = getHostFromUrl(requestingOrigin) ?? getHostFromUrl(webContents?.getURL?.())
+        if (!requestingHost) {
+            return permission === 'media' || permission === 'fullscreen' || permission === 'mediaKeySystem'
+        }
+
         return isTrustedRequestingHost(requestingHost, permission)
     })
 
