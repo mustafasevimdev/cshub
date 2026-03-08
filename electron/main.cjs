@@ -8,6 +8,20 @@ let tray = null
 let isQuitting = false
 let rendererServer = null
 let rendererServerUrl = null
+let musicWindow = null
+let musicWindowReadyPromise = null
+let musicStatePollInterval = null
+
+const DEFAULT_MUSIC_STATE = {
+    songId: null,
+    currentTime: 0,
+    duration: 0,
+    playerState: -1,
+    isMuted: true,
+    isReady: false,
+    videoId: null,
+}
+let musicPlaybackState = { ...DEFAULT_MUSIC_STATE }
 
 const YOUTUBE_SEARCH_BASE = 'https://www.youtube.com/results?hl=tr&gl=TR&persist_hl=1&persist_gl=1&has_verified=1&bpctr=9999999999&search_query='
 const YOUTUBE_SEARCH_FALLBACK_BASE = 'https://r.jina.ai/http://www.youtube.com/results?hl=tr&gl=TR&persist_hl=1&persist_gl=1&has_verified=1&bpctr=9999999999&search_query='
@@ -46,6 +60,311 @@ const MIME_TYPES = {
 }
 
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required')
+
+function extractYouTubeVideoIdFromUrl(value) {
+    if (typeof value !== 'string') return null
+
+    const patterns = [
+        /(?:youtube\.com\/watch\?v=|youtu\.be\/)([A-Za-z0-9_-]{11})/i,
+        /[?&]v=([A-Za-z0-9_-]{11})/i,
+        /\/embed\/([A-Za-z0-9_-]{11})/i,
+    ]
+
+    for (const pattern of patterns) {
+        const match = value.match(pattern)
+        if (match?.[1]) return match[1]
+    }
+
+    return null
+}
+
+function buildMusicPlayerHtml() {
+    return `<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>CsHub Music Player</title>
+    <style>
+      html, body, #player {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: #000;
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="player"></div>
+    <script>
+      (() => {
+        let player = null
+        let playerReady = false
+        let currentVideoId = null
+        let currentSongId = null
+        let mutedState = true
+
+        const emit = (type, payload) => {
+          console.log(type + JSON.stringify(payload))
+        }
+
+        const getSnapshot = () => {
+          const currentTime = playerReady && player ? Number(player.getCurrentTime?.() || 0) : 0
+          const duration = playerReady && player ? Number(player.getDuration?.() || 0) : 0
+          const playerState = player ? Number(player.getPlayerState?.() ?? -1) : -1
+          return {
+            songId: currentSongId,
+            currentTime: Number.isFinite(currentTime) ? currentTime : 0,
+            duration: Number.isFinite(duration) ? duration : 0,
+            playerState,
+            isMuted: mutedState,
+            isReady: playerReady,
+            videoId: currentVideoId,
+          }
+        }
+
+        const emitState = () => emit('__CSHUB_MUSIC_STATE__', getSnapshot())
+
+        const ensureApi = () => new Promise((resolve) => {
+          if (window.YT?.Player) {
+            resolve(window.YT)
+            return
+          }
+
+          const existing = document.querySelector('script[data-youtube-api="true"]')
+          if (!existing) {
+            const script = document.createElement('script')
+            script.src = 'https://www.youtube.com/iframe_api'
+            script.async = true
+            script.dataset.youtubeApi = 'true'
+            document.body.appendChild(script)
+          }
+
+          const previousReady = window.onYouTubeIframeAPIReady
+          window.onYouTubeIframeAPIReady = () => {
+            previousReady?.()
+            resolve(window.YT)
+          }
+        })
+
+        const destroyPlayer = () => {
+          if (!player) return
+          try {
+            player.destroy()
+          } catch {}
+          player = null
+          playerReady = false
+        }
+
+        const createPlayer = async (videoId, songId, startAt = 0, muted = true) => {
+          await ensureApi()
+          destroyPlayer()
+
+          currentVideoId = videoId
+          currentSongId = songId ?? null
+          mutedState = Boolean(muted)
+
+          player = new window.YT.Player('player', {
+            width: '320',
+            height: '180',
+            host: 'https://www.youtube-nocookie.com',
+            videoId,
+            playerVars: {
+              autoplay: 1,
+              controls: 0,
+              disablekb: 1,
+              fs: 0,
+              modestbranding: 1,
+              iv_load_policy: 3,
+              playsinline: 1,
+              rel: 0,
+              mute: 1,
+            },
+            events: {
+              onReady: (event) => {
+                playerReady = true
+                if (startAt > 0) {
+                  event.target.seekTo(startAt, true)
+                }
+                event.target.mute()
+                mutedState = true
+                event.target.playVideo()
+                emitState()
+              },
+              onStateChange: (event) => {
+                if (event.data === 1) {
+                  if (mutedState) event.target.mute()
+                  else event.target.unMute()
+                }
+                emitState()
+              },
+              onError: (event) => {
+                emit('__CSHUB_MUSIC_ERROR__', { code: event.data, songId: currentSongId, videoId: currentVideoId })
+              },
+            },
+          })
+        }
+
+        window.__CSHUB_PLAYER__ = {
+          getSnapshot,
+          async play({ videoId, songId, startAt = 0, muted = true }) {
+            if (!videoId) return false
+            await createPlayer(videoId, songId, startAt, muted)
+            return true
+          },
+          pause(seconds) {
+            if (!player) return false
+            if (typeof seconds === 'number' && Number.isFinite(seconds)) {
+              player.seekTo(seconds, true)
+            }
+            player.pauseVideo()
+            emitState()
+            return true
+          },
+          resume(seconds) {
+            if (!player) return false
+            if (typeof seconds === 'number' && Number.isFinite(seconds)) {
+              player.seekTo(seconds, true)
+            }
+            player.playVideo()
+            emitState()
+            return true
+          },
+          seek(seconds) {
+            if (!player || !Number.isFinite(seconds)) return false
+            player.seekTo(seconds, true)
+            emitState()
+            return true
+          },
+          setMuted(muted) {
+            mutedState = Boolean(muted)
+            if (!player) return true
+            if (mutedState) player.mute()
+            else player.unMute()
+            emitState()
+            return true
+          },
+          stop() {
+            destroyPlayer()
+            currentVideoId = null
+            currentSongId = null
+            mutedState = true
+            emitState()
+            return true
+          },
+        }
+
+        window.setInterval(emitState, 500)
+      })()
+    </script>
+  </body>
+</html>`
+}
+
+function broadcastMusicState() {
+    if (!mainWindow || mainWindow.isDestroyed()) return
+    mainWindow.webContents.send('music:state-change', musicPlaybackState)
+}
+
+function resetMusicState() {
+    musicPlaybackState = { ...DEFAULT_MUSIC_STATE }
+    broadcastMusicState()
+}
+
+async function ensureMusicWindow() {
+    if (musicWindow && !musicWindow.isDestroyed()) {
+        return musicWindow
+    }
+
+    if (musicWindowReadyPromise) {
+        await musicWindowReadyPromise
+        return musicWindow
+    }
+
+    musicWindow = new BrowserWindow({
+        show: false,
+        width: 320,
+        height: 180,
+        frame: false,
+        transparent: true,
+        backgroundColor: '#000000',
+        webPreferences: {
+            autoplayPolicy: 'no-user-gesture-required',
+            backgroundThrottling: false,
+            contextIsolation: true,
+            sandbox: false,
+        },
+    })
+    musicWindow.webContents.setAudioMuted(false)
+    musicWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+    musicWindow.on('closed', () => {
+        musicWindow = null
+        musicWindowReadyPromise = null
+        if (musicStatePollInterval !== null) {
+            clearInterval(musicStatePollInterval)
+            musicStatePollInterval = null
+        }
+        resetMusicState()
+    })
+    musicWindow.webContents.on('console-message', (_event, _level, message) => {
+        if (typeof message !== 'string') return
+
+        if (message.startsWith('__CSHUB_MUSIC_STATE__')) {
+            try {
+                musicPlaybackState = {
+                    ...DEFAULT_MUSIC_STATE,
+                    ...JSON.parse(message.slice('__CSHUB_MUSIC_STATE__'.length)),
+                }
+                broadcastMusicState()
+            } catch (error) {
+                console.error('Failed to parse music player state:', error)
+            }
+            return
+        }
+
+        if (message.startsWith('__CSHUB_MUSIC_ERROR__')) {
+            console.error('Hidden music player error:', message.slice('__CSHUB_MUSIC_ERROR__'.length))
+        }
+    })
+
+    const pageUrl = `data:text/html;charset=UTF-8,${encodeURIComponent(buildMusicPlayerHtml())}`
+    musicWindowReadyPromise = musicWindow.loadURL(pageUrl).then(() => {
+        if (musicStatePollInterval !== null) {
+            clearInterval(musicStatePollInterval)
+        }
+        musicStatePollInterval = setInterval(async () => {
+            if (!musicWindow || musicWindow.isDestroyed()) return
+            try {
+                const snapshot = await musicWindow.webContents.executeJavaScript(
+                    'window.__CSHUB_PLAYER__ ? window.__CSHUB_PLAYER__.getSnapshot() : null',
+                    true,
+                )
+                if (snapshot) {
+                    musicPlaybackState = { ...DEFAULT_MUSIC_STATE, ...snapshot }
+                    broadcastMusicState()
+                }
+            } catch {}
+        }, 500)
+        return musicWindow
+    }).finally(() => {
+        musicWindowReadyPromise = null
+    })
+
+    await musicWindowReadyPromise
+    return musicWindow
+}
+
+async function executeMusicCommand(script) {
+    const win = await ensureMusicWindow()
+    if (!win || win.isDestroyed()) return false
+
+    try {
+        return await win.webContents.executeJavaScript(script, true)
+    } catch (error) {
+        console.error('Music command failed:', error)
+        return false
+    }
+}
 
 function extractFirstYouTubeVideoId(value) {
     const patterns = [
@@ -434,6 +753,50 @@ ipcMain.handle('music:resolve-youtube-search', async (_event, query) => {
     }
 })
 
+ipcMain.handle('music:play', async (_event, payload) => {
+    const videoId = extractYouTubeVideoIdFromUrl(payload?.url)
+    if (!videoId || !payload?.songId) {
+        return false
+    }
+
+    return executeMusicCommand(
+        `window.__CSHUB_PLAYER__.play(${JSON.stringify({
+            videoId,
+            songId: payload.songId,
+            startAt: payload.startAt ?? 0,
+            muted: payload.muted ?? true,
+        })})`,
+    )
+})
+
+ipcMain.handle('music:pause', async (_event, seconds) => {
+    return executeMusicCommand(`window.__CSHUB_PLAYER__.pause(${JSON.stringify(seconds)})`)
+})
+
+ipcMain.handle('music:resume', async (_event, seconds) => {
+    return executeMusicCommand(`window.__CSHUB_PLAYER__.resume(${JSON.stringify(seconds)})`)
+})
+
+ipcMain.handle('music:seek', async (_event, seconds) => {
+    return executeMusicCommand(`window.__CSHUB_PLAYER__.seek(${JSON.stringify(seconds)})`)
+})
+
+ipcMain.handle('music:stop', async () => {
+    const stopped = await executeMusicCommand('window.__CSHUB_PLAYER__.stop()')
+    if (stopped) {
+        resetMusicState()
+    }
+    return stopped
+})
+
+ipcMain.handle('music:set-muted', async (_event, muted) => {
+    return executeMusicCommand(`window.__CSHUB_PLAYER__.setMuted(${JSON.stringify(Boolean(muted))})`)
+})
+
+ipcMain.handle('music:get-state', async () => {
+    return musicPlaybackState
+})
+
 app.whenReady().then(() => {
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
         if (!ALLOWED_PERMISSIONS.has(permission)) {
@@ -501,6 +864,14 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
     isQuitting = true
+    if (musicStatePollInterval !== null) {
+        clearInterval(musicStatePollInterval)
+        musicStatePollInterval = null
+    }
+    if (musicWindow && !musicWindow.isDestroyed()) {
+        musicWindow.destroy()
+        musicWindow = null
+    }
     rendererServer?.close()
 })
 

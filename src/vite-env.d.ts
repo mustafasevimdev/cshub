@@ -5,10 +5,34 @@ interface Window {
         getAppVersion: () => Promise<string>
         openExternal: (url: string) => Promise<boolean>
         resolveYouTubeSearch: (query: string) => Promise<{ url: string; title?: string } | null>
+        playMusic: (payload: { songId: string; url: string; startAt?: number; muted?: boolean }) => Promise<boolean>
+        pauseMusic: (seconds?: number) => Promise<boolean>
+        resumeMusic: (seconds?: number) => Promise<boolean>
+        seekMusic: (seconds: number) => Promise<boolean>
+        stopMusic: () => Promise<boolean>
+        setMusicMuted: (muted: boolean) => Promise<boolean>
+        getMusicState: () => Promise<{
+            songId: string | null
+            currentTime: number
+            duration: number
+            playerState: number
+            isMuted: boolean
+            isReady: boolean
+            videoId: string | null
+        }>
         minimizeWindow: () => Promise<void>
         maximizeWindow: () => Promise<void>
         closeWindow: () => Promise<void>
         isMaximized: () => Promise<boolean>
+        onMusicStateChange: (callback: (payload: {
+            songId: string | null
+            currentTime: number
+            duration: number
+            playerState: number
+            isMuted: boolean
+            isReady: boolean
+            videoId: string | null
+        }) => void) => () => void
         onMaximizedChange: (callback: (isMaximized: boolean) => void) => () => void
     }
 }
@@ -23,6 +47,7 @@ interface Window {
             options: {
                 width?: string
                 height?: string
+                host?: string
                 videoId?: string
                 playerVars?: Record<string, string | number | undefined>
                 events?: {
@@ -45,6 +70,7 @@ interface Window {
 declare namespace YT {
     interface Player {
         destroy: () => void
+        getIframe: () => HTMLIFrameElement
         getCurrentTime: () => number
         getDuration: () => number
         mute: () => void
