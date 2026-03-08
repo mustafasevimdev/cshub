@@ -503,6 +503,13 @@ export function useVoice(channelId: string | null) {
 
                 if (type === 'ice-candidate' && data) {
                     const candidate = data as RTCIceCandidateInit
+                    if (!peerConnection) {
+                        const queuedCandidates = pendingIceCandidatesRef.current.get(fromUserId) ?? []
+                        queuedCandidates.push(candidate)
+                        pendingIceCandidatesRef.current.set(fromUserId, queuedCandidates)
+                        return
+                    }
+
                     if (!peerConnection.remoteDescription) {
                         const queuedCandidates = pendingIceCandidatesRef.current.get(fromUserId) ?? []
                         queuedCandidates.push(candidate)

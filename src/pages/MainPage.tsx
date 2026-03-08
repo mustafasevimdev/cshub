@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useChannels, useMessages, useAuth, useVoice, useMusic } from '@/hooks'
 import { useAppStore, useAuthStore } from '@/stores'
 import { SettingsModal, TitleBar } from '@/components'
+import { supabase } from '@/lib/supabase'
 import type { Channel } from '@/types'
 
 const UI = {
@@ -67,6 +68,13 @@ const Icons = {
   music: '\uD83C\uDFB5',
 }
 
+type MusicSyncAction = 'pause' | 'resume' | 'restart'
+
+interface MusicSyncPayload {
+  action: MusicSyncAction
+  songId: string
+}
+
 export function MainPage() {
   const user = useAuthStore((state) => state.user)
   const { logout, updateAvatar } = useAuth()
@@ -101,6 +109,7 @@ export function MainPage() {
   const playerSessionRef = useRef(0)
   const isSkippingRef = useRef(false)
   const isMusicControlBusyRef = useRef(false)
+  const musicSyncChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
 
   const isSearchSource = (value: string) => value.startsWith('ytsearch:')
   const toSearchQuery = (value: string) => decodeURIComponent(value.slice('ytsearch:'.length))
@@ -336,9 +345,21 @@ export function MainPage() {
     }
   }, [])
 
-  const handlePreviousSong = useCallback(() => {
-    if (isMusicControlBusyRef.current) return
+  const broadcastMusicSync = useCallback(async (payload: MusicSyncPayload) => {
+    if (!voiceChannelId || !musicSyncChannelRef.current) return
 
+    try {
+      await musicSyncChannelRef.current.send({
+        type: 'broadcast',
+        event: 'music-control',
+        payload,
+      })
+    } catch (error) {
+      console.error('Failed to broadcast music sync action:', error)
+    }
+  }, [voiceChannelId])
+
+  const applyRestartPlayback = useCallback(() => {
     const didRun = runPlayerCommand((player) => {
       player.seekTo(0, true)
       player.playVideo()
@@ -348,14 +369,53 @@ export function MainPage() {
       if (currentSong) {
         setPlayerNonce((prev) => prev + 1)
       }
-      return
+      return false
     }
 
     setIsPlaybackPaused(false)
     setSongProgress(0)
     startProgressTimer()
     updateProgressFromPlayer()
+    return true
   }, [currentSong, runPlayerCommand, startProgressTimer, updateProgressFromPlayer])
+
+  const applyResumePlayback = useCallback(() => {
+    const didRun = runPlayerCommand((player) => {
+      player.playVideo()
+    })
+    if (!didRun) {
+      if (currentSong) {
+        setPlayerNonce((prev) => prev + 1)
+      }
+      return false
+    }
+
+    setIsPlaybackPaused(false)
+    startProgressTimer()
+    return true
+  }, [currentSong, runPlayerCommand, startProgressTimer])
+
+  const applyPausePlayback = useCallback(() => {
+    const didRun = runPlayerCommand((player) => {
+      player.pauseVideo()
+    })
+    if (!didRun) return false
+
+    setIsPlaybackPaused(true)
+    stopProgressTimer()
+    updateProgressFromPlayer()
+    return true
+  }, [runPlayerCommand, stopProgressTimer, updateProgressFromPlayer])
+
+  const handlePreviousSong = useCallback(() => {
+    if (isMusicControlBusyRef.current) return
+
+    if (!currentSong) return
+    const restarted = applyRestartPlayback()
+    if (restarted) {
+      void broadcastMusicSync({ action: 'restart', songId: currentSong.id })
+    }
+  }, [applyRestartPlayback, broadcastMusicSync, currentSong])
 
   const handleNextSong = useCallback(async () => {
     if (isSkippingRef.current || isMusicControlBusyRef.current) return
@@ -384,34 +444,64 @@ export function MainPage() {
     isMusicControlBusyRef.current = true
 
     try {
-      if (isPlaybackPaused) {
-        const didResume = runPlayerCommand((player) => {
-          player.playVideo()
-        })
-        if (!didResume) {
-          if (currentSong) {
-            setPlayerNonce((prev) => prev + 1)
-          }
-          return
-        }
+      if (!currentSong) return
 
-        setIsPlaybackPaused(false)
-        startProgressTimer()
+      if (isPlaybackPaused) {
+        const resumed = applyResumePlayback()
+        if (resumed) {
+          void broadcastMusicSync({ action: 'resume', songId: currentSong.id })
+        }
         return
       }
 
-      const didPause = runPlayerCommand((player) => {
-        player.pauseVideo()
-      })
-      if (!didPause) return
-
-      setIsPlaybackPaused(true)
-      stopProgressTimer()
-      updateProgressFromPlayer()
+      const paused = applyPausePlayback()
+      if (paused) {
+        void broadcastMusicSync({ action: 'pause', songId: currentSong.id })
+      }
     } finally {
       isMusicControlBusyRef.current = false
     }
-  }, [currentSong, isPlaybackPaused, runPlayerCommand, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [applyPausePlayback, applyResumePlayback, broadcastMusicSync, currentSong, isPlaybackPaused])
+
+  useEffect(() => {
+    if (!voiceChannelId) {
+      if (musicSyncChannelRef.current) {
+        void musicSyncChannelRef.current.unsubscribe()
+        musicSyncChannelRef.current = null
+      }
+      return
+    }
+
+    const syncChannel = supabase
+      .channel(`music_sync:${voiceChannelId}`)
+      .on('broadcast', { event: 'music-control' }, ({ payload }: { payload: MusicSyncPayload }) => {
+        if (!currentSong || payload.songId !== currentSong.id) return
+
+        if (payload.action === 'pause') {
+          applyPausePlayback()
+          return
+        }
+
+        if (payload.action === 'resume') {
+          applyResumePlayback()
+          return
+        }
+
+        if (payload.action === 'restart') {
+          applyRestartPlayback()
+        }
+      })
+      .subscribe()
+
+    musicSyncChannelRef.current = syncChannel
+
+    return () => {
+      if (musicSyncChannelRef.current === syncChannel) {
+        musicSyncChannelRef.current = null
+      }
+      void syncChannel.unsubscribe()
+    }
+  }, [voiceChannelId, currentSong, applyPausePlayback, applyResumePlayback, applyRestartPlayback])
 
   useEffect(() => {
     const source = currentSong?.youtube_url
