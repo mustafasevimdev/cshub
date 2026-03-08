@@ -653,7 +653,7 @@ export function MainPage() {
             playbackSource = resolved.source
             searchQuery = null
 
-            if (isSongOwner && currentSong && resolved.source !== source) {
+            if (currentSong && resolved.source !== source) {
               void supabase
                 .from('music_queue')
                 .update({ youtube_url: resolved.source, title: resolved.title ?? currentSong.title } as never)
@@ -755,7 +755,6 @@ export function MainPage() {
                   startProgressTimer()
 
                   if (
-                    isSongOwner &&
                     currentSong &&
                     isSearchSource(currentSong.youtube_url) &&
                     persistedResolvedSourceForSongRef.current !== currentSong.id
