@@ -47,6 +47,7 @@ const TRUSTED_EMBED_HOST_SUFFIXES = [
     'youtu.be',
     'googlevideo.com',
     'ytimg.com',
+    'youtube-nocookie.com',
 ]
 const YOUTUBE_CONSENT_COOKIES = [
     {
