@@ -901,7 +901,7 @@ async function createWindow() {
 
     const startUrl = isDev
         ? 'http://localhost:3000'
-        : await startRendererServer()
+        : 'https://cshub.vercel.app'
 
     void mainWindow.loadURL(startUrl)
 
