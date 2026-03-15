@@ -5,6 +5,7 @@ interface Window {
         getAppVersion: () => Promise<string>
         openExternal: (url: string) => Promise<boolean>
         resolveYouTubeSearch: (query: string) => Promise<{ url: string; title?: string } | null>
+        resolveAudioSource: (url: string) => Promise<{ streamUrl: string; proxyUrl?: string; videoId: string; duration: number; title?: string } | null>
         playMusic: (payload: { songId: string; url: string; startAt?: number; muted?: boolean }) => Promise<boolean>
         pauseMusic: (seconds?: number) => Promise<boolean>
         resumeMusic: (seconds?: number) => Promise<boolean>

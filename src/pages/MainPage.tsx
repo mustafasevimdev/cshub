@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useChannels, useMessages, useAuth, useVoice, useMusic } from '@/hooks'
+import { useChannels, useMessages, useAuth, useVoice, useMusic, useNotificationSounds } from '@/hooks'
 import { useAppStore, useAuthStore } from '@/stores'
 import { SettingsModal, TitleBar } from '@/components'
 import { supabase } from '@/lib/supabase'
@@ -104,6 +104,7 @@ export function MainPage() {
   const { messages, loading: messagesLoading, sendMessage, clearChannelMessages, messagesEndRef } = useMessages(activeChannel?.id || null)
   const { isPlaying, currentSong, addToQueue, nextSong, stopSong } = useMusic(voiceChannelId)
   const { toggleMute, toggleDeafen, startScreenShare, stopScreenShare, isMuted, isDeafened, isScreenSharing, speakingUsers, isConnected, participants, remoteStreams, screenShareStream } = useVoice(voiceChannelId)
+  const { playJoinSound, playLeaveSound, playMessageSound } = useNotificationSounds()
 
   const [messageInput, setMessageInput] = useState('')
   const [showCreateChannel, setShowCreateChannel] = useState(false)
@@ -118,10 +119,14 @@ export function MainPage() {
   const [songTimeLabel, setSongTimeLabel] = useState('0:00 / 0:00')
   const [isPlaybackPaused, setIsPlaybackPaused] = useState(false)
   const [useElectronRendererFallback, setUseElectronRendererFallback] = useState(isElectronRuntime)
+  const [forceElectronWebPlayback, setForceElectronWebPlayback] = useState(isElectronRuntime)
+  const [isRendererAudioMounted, setIsRendererAudioMounted] = useState(false)
   const [watchingScreen, setWatchingScreen] = useState<{ userId: string; nickname: string } | null>(null)
   const [isWatchingScreenFullscreen, setIsWatchingScreenFullscreen] = useState(false)
   const [selectedCommandIndex, setSelectedCommandIndex] = useState(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const electronAudioRef = useRef<HTMLAudioElement | null>(null)
+  const electronAudioMetaRef = useRef<{ songId: string | null; videoId: string | null }>({ songId: null, videoId: null })
   const playerHostRef = useRef<HTMLDivElement | null>(null)
   const watchingScreenVideoRef = useRef<HTMLVideoElement | null>(null)
   const playerRef = useRef<YT.Player | null>(null)
@@ -143,6 +148,12 @@ export function MainPage() {
   const isSongOwner = Boolean(currentSong && user?.id === currentSong.user_id)
   const currentSongId = currentSong?.id ?? null
   const useElectronMusicBridge = isElectronRuntime && !useElectronRendererFallback
+  const useElectronRendererAudio = isElectronRuntime && !useElectronMusicBridge && !forceElectronWebPlayback
+
+  const bindElectronAudioRef = useCallback((element: HTMLAudioElement | null) => {
+    electronAudioRef.current = element
+    setIsRendererAudioMounted(Boolean(element))
+  }, [])
 
   const isSearchSource = (value: string) => value.startsWith('ytsearch:')
   const toSearchQuery = (value: string) => decodeURIComponent(value.slice('ytsearch:'.length))
@@ -162,7 +173,13 @@ export function MainPage() {
       iframe.setAttribute('referrerpolicy', 'origin')
       iframe.setAttribute('tabindex', '-1')
       iframe.style.pointerEvents = 'none'
-      iframe.style.opacity = '0'
+      iframe.style.position = 'absolute'
+      iframe.style.inset = '0'
+      iframe.style.width = '100%'
+      iframe.style.height = '100%'
+      iframe.style.border = '0'
+      iframe.style.opacity = '0.01'
+      iframe.style.clipPath = 'inset(50%)'
     } catch (error) {
       console.error('Failed to configure YouTube iframe:', error)
     }
@@ -298,6 +315,29 @@ export function MainPage() {
     setWatchingScreen(null)
   }, [exitWatchingScreenFullscreen])
 
+  // Notification sounds for voice participant changes
+  const prevParticipantCountRef = useRef(participants.length)
+  useEffect(() => {
+    const prevCount = prevParticipantCountRef.current
+    const newCount = participants.length
+    prevParticipantCountRef.current = newCount
+
+    if (prevCount === 0 || !isConnected) return
+    if (newCount > prevCount) playJoinSound()
+    else if (newCount < prevCount) playLeaveSound()
+  }, [participants.length, isConnected, playJoinSound, playLeaveSound])
+
+  // Notification sound for new messages
+  const prevMessageCountRef = useRef(messages.length)
+  useEffect(() => {
+    const prevCount = prevMessageCountRef.current
+    const newCount = messages.length
+    prevMessageCountRef.current = newCount
+
+    if (prevCount === 0) return
+    if (newCount > prevCount) playMessageSound()
+  }, [messages.length, playMessageSound])
+
   const formatTime = (dateString: string) => new Date(dateString).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
   const getDefaultAvatar = (nickname: string) => `https://api.dicebear.com/7.x/initials/svg?seed=${nickname}&backgroundColor=5865F2`
   const filteredCommands = useMemo(
@@ -381,6 +421,24 @@ export function MainPage() {
       return
     }
 
+    if (useElectronRendererAudio) {
+      const audio = electronAudioRef.current
+      if (!audio) return
+
+      const duration = Number(audio.duration || 0)
+      const currentTime = Number(audio.currentTime || 0)
+
+      if (!Number.isFinite(duration) || duration <= 0) {
+        setSongProgress(0)
+        setSongTimeLabel('0:00 / 0:00')
+        return
+      }
+
+      setSongProgress(Math.min(100, (currentTime / duration) * 100))
+      setSongTimeLabel(`${formatDuration(currentTime)} / ${formatDuration(duration)}`)
+      return
+    }
+
     const player = playerRef.current
     if (!player) return
 
@@ -395,7 +453,7 @@ export function MainPage() {
 
     setSongProgress(Math.min(100, (currentTime / duration) * 100))
     setSongTimeLabel(`${formatDuration(currentTime)} / ${formatDuration(duration)}`)
-  }, [electronMusicState?.currentTime, electronMusicState?.duration, formatDuration, useElectronMusicBridge])
+  }, [electronMusicState?.currentTime, electronMusicState?.duration, formatDuration, useElectronRendererAudio, useElectronMusicBridge])
 
   const stopProgressTimer = useCallback(() => {
     if (progressTimerRef.current !== null) {
@@ -506,6 +564,13 @@ export function MainPage() {
       return electronMusicState?.currentTime ?? 0
     }
 
+    if (useElectronRendererAudio) {
+      const audio = electronAudioRef.current
+      if (!audio) return 0
+      const currentTime = Number(audio.currentTime || 0)
+      return Number.isFinite(currentTime) ? currentTime : 0
+    }
+
     const player = playerRef.current
     if (!player || !playerReadyRef.current) return 0
 
@@ -515,7 +580,7 @@ export function MainPage() {
     } catch {
       return 0
     }
-  }, [electronMusicState?.currentTime, useElectronMusicBridge])
+  }, [electronMusicState?.currentTime, useElectronRendererAudio, useElectronMusicBridge])
 
   const getSyncedPlaybackPosition = useCallback(async () => {
     if (useElectronMusicBridge && window.electronAPI) {
@@ -526,8 +591,16 @@ export function MainPage() {
     return getPlayerCurrentTime()
   }, [getPlayerCurrentTime, useElectronMusicBridge])
 
-
   useEffect(() => {
+    if (useElectronRendererAudio) {
+      const audio = electronAudioRef.current
+      if (audio) {
+        audio.muted = isDeafened
+        updateProgressFromPlayer()
+      }
+      return
+    }
+
     const didRun = runPlayerCommand((player) => {
       if (isDeafened) player.mute()
       else player.unMute()
@@ -539,7 +612,7 @@ export function MainPage() {
     if (useElectronMusicBridge && window.electronAPI) {
       void window.electronAPI.setMusicMuted(isDeafened)
     }
-  }, [isDeafened, runPlayerCommand, updateProgressFromPlayer, useElectronMusicBridge])
+  }, [isDeafened, runPlayerCommand, updateProgressFromPlayer, useElectronMusicBridge, useElectronRendererAudio])
 
   const broadcastMusicSync = useCallback(async (payload: MusicSyncPayload) => {
     if (!voiceChannelId || !musicSyncChannelRef.current) return
@@ -567,6 +640,25 @@ export function MainPage() {
       return true
     }
 
+    if (useElectronRendererAudio) {
+      const audio = electronAudioRef.current
+      if (!audio || !audio.src) return false
+
+      try {
+        audio.currentTime = startAtSeconds
+      } catch {
+        return false
+      }
+
+      void audio.play().catch((error) => {
+        console.error('Electron renderer audio restart failed:', error)
+      })
+      setIsPlaybackPaused(false)
+      startProgressTimer()
+      updateProgressFromPlayer()
+      return true
+    }
+
     const didRun = runPlayerCommand((player) => {
       player.seekTo(startAtSeconds, true)
       player.playVideo()
@@ -584,7 +676,7 @@ export function MainPage() {
     startProgressTimer()
     updateProgressFromPlayer()
     return true
-  }, [currentSong, isDeafened, runPlayerCommand, startProgressTimer, updateProgressFromPlayer, useElectronMusicBridge])
+  }, [currentSong, isDeafened, runPlayerCommand, startProgressTimer, updateProgressFromPlayer, useElectronMusicBridge, useElectronRendererAudio])
 
   const applyResumePlayback = useCallback((startAtSeconds?: number) => {
     if (useElectronMusicBridge && window.electronAPI && currentSong) {
@@ -607,6 +699,26 @@ export function MainPage() {
       return true
     }
 
+    if (useElectronRendererAudio) {
+      const audio = electronAudioRef.current
+      if (!audio || !audio.src) return false
+
+      try {
+        if (typeof startAtSeconds === 'number' && Number.isFinite(startAtSeconds) && startAtSeconds >= 0) {
+          audio.currentTime = startAtSeconds
+        }
+      } catch {
+        return false
+      }
+
+      void audio.play().catch((error) => {
+        console.error('Electron renderer audio resume failed:', error)
+      })
+      setIsPlaybackPaused(false)
+      startProgressTimer()
+      return true
+    }
+
     const didRun = runPlayerCommand((player) => {
       if (typeof startAtSeconds === 'number' && Number.isFinite(startAtSeconds) && startAtSeconds >= 0) {
         player.seekTo(startAtSeconds, true)
@@ -623,13 +735,32 @@ export function MainPage() {
     setIsPlaybackPaused(false)
     startProgressTimer()
     return true
-  }, [currentSong, electronMusicState?.playerState, electronMusicState?.songId, isDeafened, runPlayerCommand, startProgressTimer, useElectronMusicBridge])
+  }, [currentSong, electronMusicState?.playerState, electronMusicState?.songId, isDeafened, runPlayerCommand, startProgressTimer, useElectronMusicBridge, useElectronRendererAudio])
 
   const applyPausePlayback = useCallback((seekToSeconds?: number) => {
     if (useElectronMusicBridge && window.electronAPI) {
       if (!electronMusicState?.songId) return false
       void window.electronAPI.pauseMusic(seekToSeconds)
       setIsPlaybackPaused(true)
+      return true
+    }
+
+    if (useElectronRendererAudio) {
+      const audio = electronAudioRef.current
+      if (!audio || !audio.src) return false
+
+      try {
+        if (typeof seekToSeconds === 'number' && Number.isFinite(seekToSeconds) && seekToSeconds >= 0) {
+          audio.currentTime = seekToSeconds
+        }
+      } catch (error) {
+        console.error('Failed to seek Electron renderer audio before pause:', error)
+      }
+
+      audio.pause()
+      setIsPlaybackPaused(true)
+      stopProgressTimer()
+      updateProgressFromPlayer()
       return true
     }
 
@@ -645,7 +776,7 @@ export function MainPage() {
     stopProgressTimer()
     updateProgressFromPlayer()
     return true
-  }, [electronMusicState?.songId, runPlayerCommand, stopProgressTimer, updateProgressFromPlayer, useElectronMusicBridge])
+  }, [electronMusicState?.songId, runPlayerCommand, stopProgressTimer, updateProgressFromPlayer, useElectronMusicBridge, useElectronRendererAudio])
 
   const handlePreviousSong = useCallback(() => {
     if (isMusicControlBusyRef.current) return
@@ -683,6 +814,68 @@ export function MainPage() {
       }, 150)
     }
   }, [destroyPlayerSafely, nextSong, stopProgressTimer])
+
+  useEffect(() => {
+    if (!useElectronRendererAudio) return
+
+    const audio = electronAudioRef.current
+    if (!audio) return
+
+    const handleLoadedMetadata = () => {
+      updateProgressFromPlayer()
+    }
+
+    const handlePlaying = () => {
+      setIsPlaybackPaused(false)
+      startProgressTimer()
+      updateProgressFromPlayer()
+    }
+
+    const handlePause = () => {
+      if (audio.ended) return
+      setIsPlaybackPaused(true)
+      stopProgressTimer()
+      updateProgressFromPlayer()
+    }
+
+    const handleWaiting = () => {
+      stopProgressTimer()
+      updateProgressFromPlayer()
+    }
+
+    const handleEnded = () => {
+      setIsPlaybackPaused(false)
+      stopProgressTimer()
+      setSongProgress(100)
+      if (isSongOwner) {
+        void handleNextSong()
+      }
+    }
+
+    const handleError = () => {
+      console.error('Electron renderer audio element failed:', audio.error)
+      setForceElectronWebPlayback(true)
+      setPlayerNonce((prev) => prev + 1)
+    }
+
+    audio.addEventListener('loadedmetadata', handleLoadedMetadata)
+    audio.addEventListener('playing', handlePlaying)
+    audio.addEventListener('pause', handlePause)
+    audio.addEventListener('waiting', handleWaiting)
+    audio.addEventListener('stalled', handleWaiting)
+    audio.addEventListener('ended', handleEnded)
+    audio.addEventListener('error', handleError)
+
+    return () => {
+      audio.removeEventListener('loadedmetadata', handleLoadedMetadata)
+      audio.removeEventListener('playing', handlePlaying)
+      audio.removeEventListener('pause', handlePause)
+      audio.removeEventListener('waiting', handleWaiting)
+      audio.removeEventListener('stalled', handleWaiting)
+      audio.removeEventListener('ended', handleEnded)
+      audio.removeEventListener('error', handleError)
+    }
+  }, [handleNextSong, isSongOwner, startProgressTimer, stopProgressTimer, updateProgressFromPlayer, useElectronRendererAudio])
 
   const handleStopCurrentSong = useCallback(async () => {
     if (isMusicControlBusyRef.current) return
@@ -872,14 +1065,25 @@ export function MainPage() {
 
   useEffect(() => {
     const source = currentSong?.youtube_url
-    if (!voiceChannelId || !source || (!useElectronMusicBridge && !playerHostRef.current) || !isConnected) {
+    const missingRendererTarget = useElectronRendererAudio ? !isRendererAudioMounted : !playerHostRef.current
+    const rendererAudio = electronAudioRef.current
+
+    if (!voiceChannelId || !source || (!useElectronMusicBridge && missingRendererTarget) || !isConnected) {
       stopProgressTimer()
       clearPlayerRecoveryTimeout()
       clearElectronPlaybackBootTimeout()
       setIsPlaybackPaused(false)
       playerSessionRef.current += 1
       destroyPlayerSafely()
-      if (isElectronRuntime && window.electronAPI) {
+      if (useElectronRendererAudio) {
+        if (rendererAudio) {
+          rendererAudio.pause()
+          rendererAudio.removeAttribute('src')
+          rendererAudio.load()
+        }
+        electronAudioMetaRef.current = { songId: null, videoId: null }
+      }
+      if (useElectronMusicBridge && window.electronAPI) {
         void window.electronAPI.stopMusic()
       }
       return
@@ -904,6 +1108,15 @@ export function MainPage() {
 
           if (!resolved?.source) {
             console.error('Electron music player could not resolve search source:', source)
+            // ytdl-core search failed — skip directly to IFrame player
+            console.warn('Falling back to YouTube IFrame player (search resolution failed)')
+            void electronAPI.stopMusic()
+            setElectronMusicState(null)
+            setSongProgress(0)
+            setSongTimeLabel('0:00 / 0:00')
+            setUseElectronRendererFallback(true)
+            setForceElectronWebPlayback(true)
+            setPlayerNonce((prev) => prev + 1)
             return
           }
 
@@ -930,16 +1143,16 @@ export function MainPage() {
         })
 
         if (!started && !cancelled) {
-          window.setTimeout(() => {
-            if (cancelled) return
-
-            void electronAPI.playMusic({
-              songId: currentSong.id,
-              url: playbackSource,
-              startAt: 0,
-              muted: isDeafened,
-            })
-          }, 250)
+          // ytdl-core playback failed — skip directly to IFrame player fallback
+          console.warn('electronAPI.playMusic returned false (ytdl-core likely blocked). Falling back to YouTube IFrame player.')
+          void electronAPI.stopMusic()
+          setElectronMusicState(null)
+          setSongProgress(0)
+          setSongTimeLabel('0:00 / 0:00')
+          setUseElectronRendererFallback(true)
+          setForceElectronWebPlayback(true)
+          setPlayerNonce((prev) => prev + 1)
+          return
         }
 
         clearElectronPlaybackBootTimeout()
@@ -951,12 +1164,13 @@ export function MainPage() {
               return
             }
 
-            console.error('Electron hidden music player stayed idle, switching to renderer fallback.', snapshot)
+            console.error('Electron hidden music player stayed idle, switching to IFrame fallback.', snapshot)
             void electronAPI.stopMusic()
             setElectronMusicState(null)
             setSongProgress(0)
             setSongTimeLabel('0:00 / 0:00')
             setUseElectronRendererFallback(true)
+            setForceElectronWebPlayback(true)
             setPlayerNonce((prev) => prev + 1)
           })
         }, 4500)
@@ -971,17 +1185,122 @@ export function MainPage() {
       }
     }
 
+    if (useElectronRendererAudio && window.electronAPI) {
+      const electronAPI = window.electronAPI
+      if (!rendererAudio) return
+
+      stopProgressTimer()
+      clearPlayerRecoveryTimeout()
+      clearElectronPlaybackBootTimeout()
+      destroyPlayerSafely()
+
+      let cancelled = false
+
+      void (async () => {
+        let playbackSource = source
+
+        if (isSearchSource(source)) {
+          const resolved = await resolveYouTubeSource(toSearchQuery(source))
+          if (cancelled || !currentSong) return
+
+          if (!resolved?.source) {
+            console.error('Electron renderer audio could not resolve search source:', source)
+            return
+          }
+
+          playbackSource = resolved.source
+
+          if (resolved.source !== source) {
+            void supabase
+              .from('music_queue')
+              .update({ youtube_url: resolved.source, title: resolved.title ?? currentSong.title } as never)
+              .eq('id', currentSong.id)
+              .then(({ error }) => {
+                if (error) {
+                  console.error('Failed to persist resolved Electron renderer source:', error)
+                }
+              })
+          }
+        }
+
+        const resolvedAudio = await electronAPI.resolveAudioSource(playbackSource)
+        if (cancelled || !currentSong) return
+
+        if (!resolvedAudio?.streamUrl) {
+          console.error('Electron renderer audio source could not be resolved:', playbackSource)
+          setForceElectronWebPlayback(true)
+          setPlayerNonce((prev) => prev + 1)
+          return
+        }
+
+        const playbackStreamUrl = resolvedAudio.proxyUrl ?? resolvedAudio.streamUrl
+
+        electronAudioMetaRef.current = {
+          songId: currentSong.id,
+          videoId: resolvedAudio.videoId ?? null,
+        }
+
+        if (
+          isSearchSource(currentSong.youtube_url) &&
+          resolvedAudio.videoId &&
+          persistedResolvedSourceForSongRef.current !== currentSong.id
+        ) {
+          persistedResolvedSourceForSongRef.current = currentSong.id
+          void supabase
+            .from('music_queue')
+            .update({ youtube_url: `https://www.youtube.com/watch?v=${resolvedAudio.videoId}` } as never)
+            .eq('id', currentSong.id)
+            .then(({ error }) => {
+              if (error) {
+                console.error('Failed to persist active Electron renderer source:', error)
+              }
+            })
+        }
+
+        rendererAudio.pause()
+        rendererAudio.src = playbackStreamUrl
+        rendererAudio.currentTime = 0
+        rendererAudio.muted = isDeafened
+        rendererAudio.preload = 'auto'
+        rendererAudio.load()
+
+        try {
+          await rendererAudio.play()
+        } catch (error) {
+          console.error('Electron renderer audio play failed:', error)
+          setForceElectronWebPlayback(true)
+          setPlayerNonce((prev) => prev + 1)
+          return
+        }
+
+        setIsPlaybackPaused(false)
+        startProgressTimer()
+        updateProgressFromPlayer()
+      })()
+
+      return () => {
+        cancelled = true
+        stopProgressTimer()
+        if (rendererAudio) {
+          rendererAudio.pause()
+          rendererAudio.removeAttribute('src')
+          rendererAudio.load()
+          electronAudioMetaRef.current = { songId: null, videoId: null }
+        }
+      }
+    }
+
     let cancelled = false
     playerSessionRef.current += 1
     const sessionId = playerSessionRef.current
     playerReadyRef.current = false
     clearPlayerRecoveryTimeout()
     const initialMuteParam = 1
-    const playerOrigin = window.location.origin.startsWith('http')
-      ? window.location.origin
-      : undefined
+    const playerOrigin = isElectronRuntime
+      ? undefined  // Electron loads from 127.0.0.1 which YouTube rejects — skip origin
+      : window.location.origin.startsWith('http') ? window.location.origin : undefined
     const effectivePlayerOrigin = disablePlayerOriginRef.current ? undefined : playerOrigin
-    const playerHost = isElectronRuntime ? 'https://www.youtube.com' : undefined
+    const playerHost = isElectronRuntime ? 'https://www.youtube-nocookie.com' : undefined
 
     void ensureYouTubeApi()
       .then(async (yt) => {
@@ -1198,10 +1517,34 @@ export function MainPage() {
       playerSessionRef.current += 1
       destroyPlayerSafely()
     }
-  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, isElectronRuntime, useElectronMusicBridge, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearElectronPlaybackBootTimeout, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, configurePlayerFrame, destroyPlayerSafely, handleNextSong, hasElectronPlaybackStarted, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
+  }, [currentSong, currentSong?.id, currentSong?.youtube_url, voiceChannelId, isConnected, playerNonce, isSongOwner, user?.id, isDeafened, isElectronRuntime, isRendererAudioMounted, useElectronMusicBridge, useElectronRendererAudio, applyPausePlayback, applyRestartPlayback, applyResumePlayback, broadcastMusicSync, clearElectronPlaybackBootTimeout, clearPlayerRecoveryTimeout, clearPlayerStartTimeout, configurePlayerFrame, destroyPlayerSafely, handleNextSong, hasElectronPlaybackStarted, startProgressTimer, stopProgressTimer, updateProgressFromPlayer])
 
   const renderMusicPlayer = () => {
     if (useElectronMusicBridge) return null
+
+    if (useElectronRendererAudio) {
+      return (
+        <audio
+          aria-hidden="true"
+          ref={bindElectronAudioRef}
+          preload="auto"
+          style={{
+            position: 'fixed',
+            width: '2px',
+            height: '2px',
+            right: '0',
+            bottom: '0',
+            opacity: 0.01,
+            overflow: 'hidden',
+            pointerEvents: 'none',
+            clipPath: 'inset(50%)',
+            contain: 'strict',
+            zIndex: 0,
+          }}
+        />
+      )
+    }
+
     if (!currentSong || !voiceChannelId) return null
 
     return (
@@ -1210,14 +1553,16 @@ export function MainPage() {
         ref={playerHostRef}
         style={{
           position: 'fixed',
-          width: '1px',
-          height: '1px',
-          left: '-10000px',
-          top: '-10000px',
-          opacity: 0,
+          width: '2px',
+          height: '2px',
+          right: '0',
+          bottom: '0',
+          opacity: 0.01,
           overflow: 'hidden',
           pointerEvents: 'none',
-          visibility: 'hidden',
+          clipPath: 'inset(50%)',
+          contain: 'strict',
+          zIndex: 0,
         }}
       />
     )
@@ -1330,6 +1675,25 @@ export function MainPage() {
             return
           }
 
+          if (useElectronRendererAudio) {
+            const audio = electronAudioRef.current
+            if (!audio) return
+            const rect = event.currentTarget.getBoundingClientRect()
+            const ratio = Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width))
+            const duration = Number(audio.duration || 0)
+            if (!Number.isFinite(duration) || duration <= 0) return
+
+            try {
+              audio.currentTime = duration * ratio
+            } catch (error) {
+              console.error('Failed to seek Electron renderer audio:', error)
+              return
+            }
+
+            updateProgressFromPlayer()
+            return
+          }
+
           const player = playerRef.current
           if (!player || !playerReadyRef.current) return
           const rect = event.currentTarget.getBoundingClientRect()
@@ -1407,7 +1771,7 @@ export function MainPage() {
   }
 
   return (
-    <div className="app-layout" style={{ flexDirection: 'column' }}>
+    <div className={`app-layout${!isElectronRuntime ? ' web-layout' : ''}`} style={{ flexDirection: 'column' }}>
       <TitleBar />
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       <aside className="sidebar">

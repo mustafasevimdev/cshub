@@ -2,6 +2,8 @@ const { app, BrowserWindow, Tray, Menu, nativeImage, desktopCapturer, ipcMain, s
 const fs = require('fs/promises')
 const http = require('http')
 const path = require('path')
+const { Readable } = require('stream')
+const ytdl = require('@distube/ytdl-core')
 
 let mainWindow = null
 let tray = null
@@ -29,6 +31,7 @@ const YOUTUBE_SEARCH_BASE = 'https://www.youtube.com/results?hl=tr&gl=TR&persist
 const YOUTUBE_SEARCH_FALLBACK_BASE = 'https://r.jina.ai/http://www.youtube.com/results?hl=tr&gl=TR&persist_hl=1&persist_gl=1&has_verified=1&bpctr=9999999999&search_query='
 const SEARCH_TIMEOUT_MS = 3000
 const SEARCH_CACHE_TTL_MS = 30 * 60 * 1000
+const AUDIO_SOURCE_CACHE_TTL_MS = 10 * 60 * 1000
 const ALLOWED_PERMISSIONS = new Set([
     'audioCapture',
     'clipboard-sanitized-write',
@@ -38,15 +41,39 @@ const ALLOWED_PERMISSIONS = new Set([
     'mediaKeySystem',
     'videoCapture',
 ])
-const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost'])
+const LOCAL_HOSTS = new Set(['127.0.0.1', 'localhost', 'cshub.vercel.app'])
 const TRUSTED_EMBED_HOST_SUFFIXES = [
     'youtube.com',
     'youtu.be',
     'googlevideo.com',
     'ytimg.com',
 ]
+const YOUTUBE_CONSENT_COOKIES = [
+    {
+        url: 'https://www.youtube.com',
+        name: 'CONSENT',
+        value: 'YES+cb.20210328-17-p0.en+FX+111',
+    },
+    {
+        url: 'https://www.youtube.com',
+        name: 'SOCS',
+        value: 'CAI',
+    },
+    {
+        url: 'https://www.youtube.com',
+        name: 'PREF',
+        value: 'hl=tr&gl=TR',
+    },
+    {
+        url: 'https://www.youtube-nocookie.com',
+        name: 'CONSENT',
+        value: 'YES+cb.20210328-17-p0.en+FX+111',
+    },
+]
 const searchCache = new Map()
 const pendingSearches = new Map()
+const audioSourceCache = new Map()
+const audioProxyEntries = new Map()
 const DIST_DIR = path.join(__dirname, '../dist')
 const MIME_TYPES = {
     '.css': 'text/css; charset=utf-8',
@@ -67,6 +94,10 @@ function getDesktopFriendlyUserAgent() {
     return app.userAgentFallback.replace(/\sElectron\/[^\s]+/i, '')
 }
 
+function getYouTubeCookieHeader() {
+    return 'CONSENT=YES+cb.20210328-17-p0.en+FX+111; SOCS=CAI; PREF=hl=tr&gl=TR'
+}
+
 function extractYouTubeVideoIdFromUrl(value) {
     if (typeof value !== 'string') return null
 
@@ -84,6 +115,84 @@ function extractYouTubeVideoIdFromUrl(value) {
     return null
 }
 
+async function resolveYouTubeAudioSource(url) {
+    const videoId = extractYouTubeVideoIdFromUrl(url)
+    if (!videoId) {
+        console.error('ytdl: Could not extract video ID from URL:', url)
+        return null
+    }
+
+    const now = Date.now()
+    const cached = audioSourceCache.get(videoId)
+    if (cached && cached.expiresAt > now) {
+        return cached.value
+    }
+
+    let info
+    try {
+        info = await ytdl.getInfo(url, {
+            requestOptions: {
+                headers: {
+                    'accept-language': 'tr-TR,tr;q=0.9,en;q=0.8',
+                    cookie: getYouTubeCookieHeader(),
+                    origin: 'https://www.youtube.com',
+                    referer: 'https://www.youtube.com/',
+                    'user-agent': getDesktopFriendlyUserAgent(),
+                },
+            },
+        })
+    } catch (error) {
+        console.error('ytdl.getInfo FAILED for', url, ':', error?.message || error)
+        return null
+    }
+
+    const candidateFormats = info.formats.filter((format) => format.hasAudio && typeof format.url === 'string' && format.url.length > 0)
+
+    if (candidateFormats.length === 0) {
+        console.error('ytdl: No audio formats found for', url, '- total formats:', info.formats.length)
+        return null
+    }
+
+    let selectedFormat = null
+    try {
+        selectedFormat = ytdl.chooseFormat(candidateFormats, { quality: 'highestaudio', filter: 'audioonly' })
+    } catch {
+        const audioOnly = candidateFormats
+            .filter((format) => format.hasAudio && !format.hasVideo)
+            .sort((left, right) => (right.audioBitrate || 0) - (left.audioBitrate || 0))
+
+        selectedFormat = audioOnly[0] || candidateFormats.sort((left, right) => (right.bitrate || 0) - (left.bitrate || 0))[0] || null
+    }
+
+    if (!selectedFormat?.url) {
+        console.error('ytdl: Selected format has no stream URL for', url)
+        return null
+    }
+
+    const resolved = {
+        streamUrl: selectedFormat.url,
+        videoId: info.videoDetails.videoId || videoId,
+        duration: Number(info.videoDetails.lengthSeconds || 0),
+        title: info.videoDetails.title || undefined,
+    }
+
+    audioSourceCache.set(videoId, {
+        value: resolved,
+        expiresAt: now + AUDIO_SOURCE_CACHE_TTL_MS,
+    })
+
+    return resolved
+}
+
+function createAudioProxyUrl(streamUrl, videoId) {
+    const token = `${videoId}:${Date.now()}:${Math.random().toString(36).slice(2, 10)}`
+    audioProxyEntries.set(token, {
+        streamUrl,
+        expiresAt: Date.now() + AUDIO_SOURCE_CACHE_TTL_MS,
+    })
+    return token
+}
+
 function buildMusicPlayerHtml() {
     return `<!DOCTYPE html>
 <html>
@@ -91,7 +200,7 @@ function buildMusicPlayerHtml() {
     <meta charset="UTF-8" />
     <title>CsHub Music Player</title>
     <style>
-      html, body, #player {
+      html, body, #audio {
         width: 100%;
         height: 100%;
         margin: 0;
@@ -101,31 +210,23 @@ function buildMusicPlayerHtml() {
     </style>
   </head>
   <body>
-    <div id="player"></div>
+    <audio id="audio" preload="auto"></audio>
     <script>
       (() => {
-        let player = null
+        const audio = document.getElementById('audio')
         let playerReady = false
         let currentVideoId = null
         let currentSongId = null
         let mutedState = true
-        let startRetryTimeout = null
+        let playerState = -1
 
         const emit = (type, payload) => {
           console.log(type + JSON.stringify(payload))
         }
 
-        const clearStartRetryTimeout = () => {
-          if (startRetryTimeout !== null) {
-            window.clearTimeout(startRetryTimeout)
-            startRetryTimeout = null
-          }
-        }
-
         const getSnapshot = () => {
-          const currentTime = playerReady && player ? Number(player.getCurrentTime?.() || 0) : 0
-          const duration = playerReady && player ? Number(player.getDuration?.() || 0) : 0
-          const playerState = player ? Number(player.getPlayerState?.() ?? -1) : -1
+          const currentTime = playerReady ? Number(audio.currentTime || 0) : 0
+          const duration = playerReady ? Number(audio.duration || 0) : 0
           return {
             songId: currentSongId,
             currentTime: Number.isFinite(currentTime) ? currentTime : 0,
@@ -139,139 +240,135 @@ function buildMusicPlayerHtml() {
 
         const emitState = () => emit('__CSHUB_MUSIC_STATE__', getSnapshot())
 
-        const ensureApi = () => new Promise((resolve) => {
-          if (window.YT?.Player) {
-            resolve(window.YT)
-            return
-          }
-
-          const existing = document.querySelector('script[data-youtube-api="true"]')
-          if (!existing) {
-            const script = document.createElement('script')
-            script.src = 'https://www.youtube.com/iframe_api'
-            script.async = true
-            script.dataset.youtubeApi = 'true'
-            document.body.appendChild(script)
-          }
-
-          const previousReady = window.onYouTubeIframeAPIReady
-          window.onYouTubeIframeAPIReady = () => {
-            previousReady?.()
-            resolve(window.YT)
-          }
-        })
-
         const destroyPlayer = () => {
-          clearStartRetryTimeout()
-          if (!player) return
-          try {
-            player.destroy()
-          } catch {}
-          player = null
+          audio.pause()
+          audio.removeAttribute('src')
+          audio.load()
           playerReady = false
+          playerState = -1
         }
 
-        const createPlayer = async (videoId, songId, startAt = 0, muted = true) => {
-          await ensureApi()
+        const createPlayer = async (streamUrl, videoId, songId, startAt = 0, muted = true) => {
           destroyPlayer()
 
           currentVideoId = videoId
           currentSongId = songId ?? null
           mutedState = Boolean(muted)
 
-          const playerOrigin = window.location.origin && window.location.origin !== 'null'
-            ? window.location.origin
-            : undefined
+          audio.currentTime = 0
+          audio.muted = mutedState
+          audio.src = streamUrl
+          playerState = 3
+          emitState()
+          audio.load()
 
-          player = new window.YT.Player('player', {
-            width: '320',
-            height: '180',
-            host: 'https://www.youtube.com',
-            videoId,
-            playerVars: {
-              autoplay: 1,
-              controls: 0,
-              disablekb: 1,
-              fs: 0,
-              modestbranding: 1,
-              iv_load_policy: 3,
-              playsinline: 1,
-              rel: 0,
-              mute: 1,
-              enablejsapi: 1,
-              origin: playerOrigin,
-            },
-            events: {
-              onReady: (event) => {
-                playerReady = true
-                if (startAt > 0) {
-                  event.target.seekTo(startAt, true)
-                }
-                event.target.mute()
-                event.target.playVideo()
-                clearStartRetryTimeout()
-                startRetryTimeout = window.setTimeout(() => {
-                  const playerState = player?.getPlayerState?.() ?? -1
-                  if (playerState !== 1) {
-                    try {
-                      player?.playVideo?.()
-                    } catch {}
-                    emit('__CSHUB_MUSIC_WARN__', { type: 'playback-unstarted-retry', songId: currentSongId, videoId: currentVideoId, playerState })
-                  }
-                }, 2500)
-                emitState()
-              },
-              onStateChange: (event) => {
-                if (event.data === 1) {
-                  clearStartRetryTimeout()
-                  if (mutedState) event.target.mute()
-                  else event.target.unMute()
-                }
-                emitState()
-              },
-              onError: (event) => {
-                emit('__CSHUB_MUSIC_ERROR__', { code: event.data, songId: currentSongId, videoId: currentVideoId })
-              },
-            },
-          })
+          const attemptPlayback = async () => {
+            try {
+              if (startAt > 0 && Number.isFinite(startAt)) {
+                audio.currentTime = startAt
+              }
+            } catch {}
+
+            try {
+              await audio.play()
+            } catch (error) {
+              emit('__CSHUB_MUSIC_ERROR__', { code: 'play-failed', message: String(error), songId: currentSongId, videoId: currentVideoId })
+            }
+          }
+
+          if (audio.readyState >= 1) {
+            playerReady = true
+            await attemptPlayback()
+          } else {
+            audio.addEventListener('loadedmetadata', () => {
+              playerReady = true
+              void attemptPlayback()
+              emitState()
+            }, { once: true })
+          }
         }
+
+        audio.addEventListener('playing', () => {
+          playerReady = true
+          playerState = 1
+          emitState()
+        })
+
+        audio.addEventListener('pause', () => {
+          if (audio.ended) return
+          playerState = 2
+          emitState()
+        })
+
+        audio.addEventListener('waiting', () => {
+          playerState = 3
+          emitState()
+        })
+
+        audio.addEventListener('stalled', () => {
+          playerState = 3
+          emitState()
+        })
+
+        audio.addEventListener('ended', () => {
+          playerState = 0
+          emitState()
+        })
+
+        audio.addEventListener('error', () => {
+          const mediaError = audio.error
+          emit('__CSHUB_MUSIC_ERROR__', {
+            code: mediaError?.code || 'audio-error',
+            message: mediaError?.message || 'Audio element failed to play',
+            songId: currentSongId,
+            videoId: currentVideoId,
+          })
+        })
 
         window.__CSHUB_PLAYER__ = {
           getSnapshot,
-          async play({ videoId, songId, startAt = 0, muted = true }) {
-            if (!videoId) return false
-            await createPlayer(videoId, songId, startAt, muted)
+          async play({ streamUrl, videoId, songId, startAt = 0, muted = true }) {
+            if (!streamUrl || !videoId) return false
+            await createPlayer(streamUrl, videoId, songId, startAt, muted)
             return true
           },
           pause(seconds) {
-            if (!player) return false
+            if (!audio.src) return false
             if (typeof seconds === 'number' && Number.isFinite(seconds)) {
-              player.seekTo(seconds, true)
+              try {
+                audio.currentTime = seconds
+              } catch {}
             }
-            player.pauseVideo()
+            audio.pause()
             emitState()
             return true
           },
           resume(seconds) {
-            if (!player) return false
+            if (!audio.src) return false
             if (typeof seconds === 'number' && Number.isFinite(seconds)) {
-              player.seekTo(seconds, true)
+              try {
+                audio.currentTime = seconds
+              } catch {}
             }
-            player.playVideo()
+            void audio.play().catch((error) => {
+              emit('__CSHUB_MUSIC_ERROR__', { code: 'resume-failed', message: String(error), songId: currentSongId, videoId: currentVideoId })
+            })
             emitState()
             return true
           },
           seek(seconds) {
-            if (!player || !Number.isFinite(seconds)) return false
-            player.seekTo(seconds, true)
+            if (!audio.src || !Number.isFinite(seconds)) return false
+            try {
+              audio.currentTime = seconds
+            } catch {
+              return false
+            }
             emitState()
             return true
           },
           setMuted(muted) {
             mutedState = Boolean(muted)
-            if (!player) return true
-            if (mutedState) player.mute()
-            else player.unMute()
+            audio.muted = mutedState
             emitState()
             return true
           },
@@ -579,7 +676,8 @@ function isAllowedEmbedHost(hostname) {
 function isTrustedRequestingHost(hostname, permission) {
     if (!hostname) return false
 
-    if (LOCAL_HOSTS.has(hostname)) {
+    // Allow localhost or trusted production hosts
+    if (LOCAL_HOSTS.has(hostname) || hostname.includes('vercel.app')) {
         return true
     }
 
@@ -589,6 +687,40 @@ function isTrustedRequestingHost(hostname, permission) {
     }
 
     return false
+}
+
+function appendCookieHeader(existingValue, requiredCookies) {
+    const existing = typeof existingValue === 'string'
+        ? existingValue.split(';').map((part) => part.trim()).filter(Boolean)
+        : []
+    const merged = new Map()
+
+    for (const cookie of existing) {
+        const [name, ...rest] = cookie.split('=')
+        if (!name) continue
+        merged.set(name.trim(), rest.join('=').trim())
+    }
+
+    for (const cookie of requiredCookies) {
+        const [name, ...rest] = cookie.split('=')
+        if (!name) continue
+        merged.set(name.trim(), rest.join('=').trim())
+    }
+
+    return Array.from(merged.entries()).map(([name, value]) => `${name}=${value}`).join('; ')
+}
+
+async function primeYouTubeSessionCookies(targetSession) {
+    await Promise.all(
+        YOUTUBE_CONSENT_COOKIES.map((cookie) => targetSession.cookies.set({
+            ...cookie,
+            secure: true,
+            sameSite: 'no_restriction',
+            expirationDate: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 365),
+        }).catch((error) => {
+            console.error('Failed to prime YouTube session cookie:', cookie.name, error)
+        })),
+    )
 }
 
 async function serveRendererRequest(req, res) {
@@ -628,7 +760,66 @@ async function startMusicPlayerServer() {
     if (musicPlayerServerUrl) return musicPlayerServerUrl
 
     musicPlayerServerUrl = await new Promise((resolve, reject) => {
-        const server = http.createServer((_req, res) => {
+        const server = http.createServer(async (req, res) => {
+            const requestUrl = new URL(req.url || '/', 'http://127.0.0.1')
+
+            if (requestUrl.pathname === '/stream') {
+                const token = requestUrl.searchParams.get('token') || ''
+                const entry = audioProxyEntries.get(token)
+                if (!entry || entry.expiresAt <= Date.now()) {
+                    audioProxyEntries.delete(token)
+                    res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' })
+                    res.end('Audio source expired')
+                    return
+                }
+
+                try {
+                    const upstreamHeaders = {
+                        'accept-language': 'tr-TR,tr;q=0.9,en;q=0.8',
+                        referer: 'https://www.youtube.com/',
+                        'user-agent': getDesktopFriendlyUserAgent(),
+                    }
+
+                    if (typeof req.headers.range === 'string' && req.headers.range.trim().length > 0) {
+                        upstreamHeaders.range = req.headers.range
+                    }
+
+                    const upstreamResponse = await fetch(entry.streamUrl, {
+                        headers: upstreamHeaders,
+                    })
+
+                    if (!upstreamResponse.ok || !upstreamResponse.body) {
+                        res.writeHead(upstreamResponse.status || 502, { 'Content-Type': 'text/plain; charset=utf-8' })
+                        res.end('Upstream audio stream failed')
+                        return
+                    }
+
+                    const responseHeaders = {
+                        'Accept-Ranges': upstreamResponse.headers.get('accept-ranges') || 'bytes',
+                        'Access-Control-Allow-Origin': '*',
+                        'Cache-Control': 'no-store',
+                        'Content-Type': upstreamResponse.headers.get('content-type') || 'audio/webm',
+                    }
+
+                    const contentLength = upstreamResponse.headers.get('content-length')
+                    const contentRange = upstreamResponse.headers.get('content-range')
+                    if (contentLength) {
+                        responseHeaders['Content-Length'] = contentLength
+                    }
+                    if (contentRange) {
+                        responseHeaders['Content-Range'] = contentRange
+                    }
+
+                    res.writeHead(upstreamResponse.status, responseHeaders)
+                    Readable.fromWeb(upstreamResponse.body).pipe(res)
+                } catch (error) {
+                    console.error('Audio proxy request failed:', error)
+                    res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' })
+                    res.end('Audio proxy failed')
+                }
+                return
+            }
+
             res.writeHead(200, {
                 'Cache-Control': 'no-store',
                 'Content-Type': 'text/html; charset=utf-8',
@@ -840,15 +1031,54 @@ ipcMain.handle('music:resolve-youtube-search', async (_event, query) => {
     }
 })
 
+ipcMain.handle('music:resolve-audio-source', async (_event, url) => {
+    try {
+        const resolved = await resolveYouTubeAudioSource(url)
+        if (!resolved?.streamUrl || !resolved.videoId) return null
+
+        const baseUrl = await startMusicPlayerServer()
+        const token = createAudioProxyUrl(resolved.streamUrl, resolved.videoId)
+
+        return {
+            ...resolved,
+            proxyUrl: `${baseUrl}/stream?token=${encodeURIComponent(token)}`,
+        }
+    } catch (error) {
+        console.error('Failed to resolve audio source in main process:', error)
+        return null
+    }
+})
+
 ipcMain.handle('music:play', async (_event, payload) => {
-    const videoId = extractYouTubeVideoIdFromUrl(payload?.url)
-    if (!videoId || !payload?.songId) {
+    if (!payload?.url || !payload?.songId) {
+        console.error('music:play - Missing url or songId in payload')
         return false
     }
 
+    console.log('music:play - Attempting to play:', payload.url, 'songId:', payload.songId)
+
+    let audioSource = null
+    try {
+        audioSource = await resolveYouTubeAudioSource(payload.url)
+    } catch (error) {
+        console.error('music:play - ytdl-core resolution threw:', error?.message || error)
+        return false
+    }
+
+    if (!audioSource?.streamUrl || !audioSource.videoId) {
+        console.error('music:play - ytdl-core returned empty/invalid audio source for:', payload.url)
+        return false
+    }
+
+    console.log('music:play - Audio source resolved, videoId:', audioSource.videoId)
+
+    const baseUrl = await startMusicPlayerServer()
+    const token = createAudioProxyUrl(audioSource.streamUrl, audioSource.videoId)
+
     return executeMusicCommand(
         `window.__CSHUB_PLAYER__.play(${JSON.stringify({
-            videoId,
+            streamUrl: `${baseUrl}/stream?token=${encodeURIComponent(token)}`,
+            videoId: audioSource.videoId,
             songId: payload.songId,
             startAt: payload.startAt ?? 0,
             muted: payload.muted ?? true,
@@ -885,6 +1115,30 @@ ipcMain.handle('music:get-state', async () => {
 })
 
 app.whenReady().then(() => {
+    void primeYouTubeSessionCookies(session.defaultSession)
+
+    session.defaultSession.webRequest.onBeforeSendHeaders((details, callback) => {
+        const hostname = getHostFromUrl(details.url)
+        if (!isAllowedEmbedHost(hostname)) {
+            callback({ requestHeaders: details.requestHeaders })
+            return
+        }
+
+        const requestHeaders = { ...details.requestHeaders }
+        const requiredCookies = [
+            'CONSENT=YES+cb.20210328-17-p0.en+FX+111',
+            'SOCS=CAI',
+            'PREF=hl=tr&gl=TR',
+        ]
+
+        requestHeaders['User-Agent'] = getDesktopFriendlyUserAgent()
+        requestHeaders['Referer'] = 'https://www.youtube.com/'
+        requestHeaders['Origin'] = 'https://www.youtube.com'
+        requestHeaders['Cookie'] = appendCookieHeader(requestHeaders['Cookie'] ?? requestHeaders['cookie'], requiredCookies)
+
+        callback({ requestHeaders })
+    })
+
     session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
         if (!ALLOWED_PERMISSIONS.has(permission)) {
             callback(false)

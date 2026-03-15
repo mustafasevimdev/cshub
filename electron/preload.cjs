@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getAppVersion: () => ipcRenderer.invoke('app:get-version'),
     openExternal: (url) => ipcRenderer.invoke('app:open-external', url),
     resolveYouTubeSearch: (query) => ipcRenderer.invoke('music:resolve-youtube-search', query),
+    resolveAudioSource: (url) => ipcRenderer.invoke('music:resolve-audio-source', url),
     playMusic: (payload) => ipcRenderer.invoke('music:play', payload),
     pauseMusic: (seconds) => ipcRenderer.invoke('music:pause', seconds),
     resumeMusic: (seconds) => ipcRenderer.invoke('music:resume', seconds),

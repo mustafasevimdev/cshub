@@ -225,20 +225,45 @@ export function useVoice(channelId: string | null) {
     }, [])
 
     const requestVoiceStream = useCallback(async (settings: AudioSettings) => {
+        const baseConstraints: MediaStreamConstraints = {
+            audio: {
+                deviceId: settings.inputDeviceId !== 'default'
+                    ? { exact: settings.inputDeviceId }
+                    : undefined,
+                echoCancellation: settings.echoCancellation,
+                noiseSuppression: settings.noiseSuppression,
+                autoGainControl: true,
+            },
+            video: false,
+        }
+
         try {
-            return await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    deviceId: settings.inputDeviceId !== 'default'
-                        ? { exact: settings.inputDeviceId }
-                        : undefined,
-                    echoCancellation: settings.echoCancellation,
-                    noiseSuppression: settings.noiseSuppression,
-                    autoGainControl: true,
-                },
-                video: false,
-            })
-        } catch {
-            return new MediaStream()
+            return await navigator.mediaDevices.getUserMedia(baseConstraints)
+        } catch (error) {
+            console.warn('Initial getUserMedia failed, attempting fallback...', error)
+            
+            try {
+                // Fallback 1: Try without exact deviceId (in case the saved device is gone)
+                return await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        echoCancellation: settings.echoCancellation,
+                        noiseSuppression: settings.noiseSuppression,
+                        autoGainControl: true,
+                    },
+                    video: false,
+                })
+            } catch (fallbackError) {
+                console.warn('Fallback getUserMedia failed, attempting generic audio...', fallbackError)
+                
+                try {
+                    // Fallback 2: Try with absolute generic audio
+                    return await navigator.mediaDevices.getUserMedia({ audio: true })
+                } catch (finalError) {
+                    console.error('All getUserMedia attempts failed:', finalError)
+                    window.alert('Mikrofona erisilemedi. Lutfen tarayici/uygulama izinlerini kontrol edin veya mikrofonun takili oldugundan emin olun.')
+                    return new MediaStream()
+                }
+            }
         }
     }, [])
 
@@ -1105,10 +1130,32 @@ export function useVoice(channelId: string | null) {
             void cleanup()
         }
 
+        const handleBeforeUnload = () => {
+            if (!channelId || !userId) return
+
+            const supabaseUrl = (import.meta as unknown as { env: Record<string, string> }).env.VITE_SUPABASE_URL
+            const supabaseKey = (import.meta as unknown as { env: Record<string, string> }).env.VITE_SUPABASE_ANON_KEY
+            if (!supabaseUrl || !supabaseKey) return
+
+            const url = `${supabaseUrl}/rest/v1/voice_participants?channel_id=eq.${encodeURIComponent(channelId)}&user_id=eq.${encodeURIComponent(userId)}`
+            void fetch(url, {
+                method: 'DELETE',
+                headers: {
+                    'apikey': supabaseKey,
+                    'Authorization': `Bearer ${supabaseKey}`,
+                    'Content-Type': 'application/json',
+                },
+                keepalive: true,
+            }).catch(() => {})
+        }
+
+        window.addEventListener('beforeunload', handleBeforeUnload)
+
         return () => {
+            window.removeEventListener('beforeunload', handleBeforeUnload)
             void cleanup()
         }
-    }, [channelId, joinVoice, cleanup])
+    }, [channelId, joinVoice, cleanup, userId])
 
     return {
         ...state,
