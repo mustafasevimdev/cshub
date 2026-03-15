@@ -1296,9 +1296,7 @@ export function MainPage() {
     playerReadyRef.current = false
     clearPlayerRecoveryTimeout()
     const initialMuteParam = 1
-    const playerOrigin = isElectronRuntime
-      ? undefined  // Electron loads from 127.0.0.1 which YouTube rejects — skip origin
-      : window.location.origin.startsWith('http') ? window.location.origin : undefined
+    const playerOrigin = window.location.origin.startsWith('http') ? window.location.origin : undefined
     const effectivePlayerOrigin = disablePlayerOriginRef.current ? undefined : playerOrigin
     const playerHost = isElectronRuntime ? 'https://www.youtube-nocookie.com' : undefined
 

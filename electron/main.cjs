@@ -1133,8 +1133,6 @@ app.whenReady().then(() => {
         ]
 
         requestHeaders['User-Agent'] = getDesktopFriendlyUserAgent()
-        requestHeaders['Referer'] = 'https://www.youtube.com/'
-        requestHeaders['Origin'] = 'https://www.youtube.com'
         requestHeaders['Cookie'] = appendCookieHeader(requestHeaders['Cookie'] ?? requestHeaders['cookie'], requiredCookies)
 
         callback({ requestHeaders })
